@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kalshi SixFilter</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, sans-serif; background: #0a0a0a; color: #e0e0e0; padding: 20px; }
+        h1 { color: #00d9ff; margin-bottom: 10px; }
+        .card { background: #151520; padding: 20px; border-radius: 12px; margin-bottom: 15px; border: 1px solid #2d2d44; }
+        input { width: 100%; padding: 12px; background: #0a0a0a; border: 1px solid #2d2d44; border-radius: 8px; color: #fff; margin-bottom: 10px; }
+        button { width: 100%; padding: 14px; background: #00d9ff; color: #000; border: none; border-radius: 8px; font-weight: bold; margin-top: 10px; }
+        .btn-success { background: #00ff88; }
+        .btn-danger { background: #ff4757; color: #fff; }
+        .filters { display: flex; gap: 5px; margin: 10px 0; }
+        .badge { width: 30px; height: 30px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: bold; }
+        .pass { background: #00ff88; color: #000; }
+        .fail { background: #ff4757; color: #fff; }
+        .signal { margin-top: 20px; }
+        .hidden { display: none; }
+    </style>
+</head>
+<body>
+    <h1>🔮 Kalshi SixFilter</h1>
+    <p style="color: #888; margin-bottom: 20px;">MIT 6-Filter Prediction Market Strategy</p>
+    
+    <div class="card">
+        <h3>Market Analysis</h3>
+        <input type="text" id="marketId" placeholder="Market ID (e.g. FED-25BP-MAY26)">
+        <input type="text" id="marketName" placeholder="Market Name">
+        <input type="number" id="yesPrice" placeholder="YES Price (¢)" min="1" max="99">
+        <input type="number" id="noPrice" placeholder="NO Price (¢)" min="1" max="99">
+        <input type="number" id="modelProb" placeholder="Your Model Prob (%)" min="0" max="100" step="0.1">
+        <input type="number" id="volume" placeholder="Volume" value="50000">
+        <button onclick="analyze()">🔍 Run SixFilter Analysis</button>
+    </div>
+    
+    <div id="result" class="card hidden">
+        <h3 id="resultTitle">Signal</h3>
+        <div id="filters" class="filters"></div>
+        <p id="resultDetails"></p>
+        <button id="executeBtn" class="btn-success hidden" onclick="execute()">Execute on Kalshi.com</button>
+    </div>
+
+<script>
+const API_URL = ''; // Same domain\nlet currentSignal = null;\n\nasync function analyze() {\n    const data = {\n        market_id: document.getElementById('marketId').value,\n        market_name: document.getElementById('marketName').value,\n        yes_price: parseFloat(document.getElementById('yesPrice').value),\n        no_price: parseFloat(document.getElementById('noPrice').value),\n        volume: parseFloat(document.getElementById('volume').value),\n        open_interest: parseFloat(document.getElementById('volume').value) * 0.5,\n        your_model_prob: parseFloat(document.getElementById('modelProb').value) / 100,\n        bankroll: 1000,\n        daily_pnl: 0,\n        consecutive_losses: 0\n    };\n    \n    const res = await fetch('/kalshi/analyze', {\n        method: 'POST',\n        headers: {'Content-Type': 'application/json'},\n        body: JSON.stringify(data)\n    });\n    \n    const signal = await res.json();\n    currentSignal = signal;\n    \n    document.getElementById('result').classList.remove('hidden');\n    document.getElementById('resultTitle').textContent = signal.proceed ? '✅ APPROVED' : '❌ REJECTED';\n    document.getElementById('resultTitle').style.color = signal.proceed ? '#00ff88' : '#ff4757';\n    \n    const filtersDiv = document.getElementById('filters');\n    filtersDiv.innerHTML = signal.filters_passed.map((p, i) => \n        `<div class="badge ${p ? 'pass' : 'fail'}">${i+1}</div>`\n    ).join('');\n    \n    document.getElementById('resultDetails').innerHTML = \n        `Side: <b>${signal.side}</b> | Contracts: <b>${signal.contracts}</b> | ` +\n        `Price: <b>${signal.limit_price}¢</b> | Edge: <b>${signal.edge_percent.toFixed(1)}%</b><br>` +\n        `Confidence: <b>${signal.confidence}%</b> | EV: <b>$${signal.expected_value.toFixed(2)}</b>`;\n    \n    document.getElementById('executeBtn').classList.toggle('hidden', !signal.proceed);\n}\n\nfunction execute() {\n    if (currentSignal) {\n        window.open(`https://kalshi.com/markets/${currentSignal.market_id}`, '_blank');\n        fetch('/kalshi/execute', {\n            method: 'POST',\n            headers: {'Content-Type': 'application/json'},\n            body: JSON.stringify({\n                market_id: currentSignal.market_id,\n                side: currentSignal.side,\n                contracts: currentSignal.contracts,\n                limit_price: currentSignal.limit_price\n            })\n        });\n    }\n}\n</script>
+</body>
+</html>
