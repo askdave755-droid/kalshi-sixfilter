@@ -1,7 +1,7 @@
 """
-Kalshi SixFilter Guardian - Complete Trading System
+Kalshi SixFilter Guardian - Adjustable Confidence
 """
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 import os
@@ -72,17 +72,15 @@ def run_sixfilter(yes_price, no_price, model_prob, bankroll=1000, daily_pnl=0, c
         True
     ]
     
-    proceed = all(filters)
-    
     return {
-        "proceed": proceed,
+        "proceed": all(filters),
         "side": side,
-        "contracts": contracts if proceed else 0,
+        "contracts": contracts if all(filters) else 0,
         "limit_price": yes_price if side == "YES" else no_price,
         "confidence": int(sum(filters) / 6 * 100),
         "filters_passed": filters,
         "edge_percent": round(edge * 100, 1),
-        "expected_value": round(ev * contracts, 2) if proceed else 0,
+        "expected_value": round(ev * contracts, 2) if all(filters) else 0,
         "kelly_fraction": round(kelly_adj, 4),
         "reason": f"6-Filters: {sum(filters)}/6 | Edge: {edge:.1%}"
     }
@@ -98,8 +96,25 @@ async def send_telegram(message: str):
         pass
 
 @app.post("/kalshi/analyze")
-async def analyze(req: MarketReq):
-    result = run_sixfilter(req.yes_price, req.no_price, req.your_model_prob, req.bankroll, req.daily_pnl, req.consecutive_losses)
+async def analyze(req: MarketReq, min_filters: int = Query(6, ge=1, le=6)):
+    """
+    SixFilter with adjustable threshold
+    min_filters: How many of 6 filters must pass (1-6)
+    """
+    result = run_sixfilter(req.yes_price, req.no_price, req.your_model_prob, 
+                         req.bankroll, req.daily_pnl, req.consecutive_losses)
+    
+    # ADJUSTABLE THRESHOLD LOGIC
+    filters_passed = sum(result["filters_passed"])
+    threshold = max(1, min(6, min_filters))
+    
+    # Override proceed based on threshold
+    result["proceed"] = filters_passed >= threshold
+    result["contracts"] = result["contracts"] if result["proceed"] else 0
+    result["threshold"] = threshold
+    result["filters_passed_count"] = filters_passed
+    result["filters_needed"] = f"{filters_passed}/{threshold} passed"
+    
     return result
 
 @app.get("/toggle-auto")
@@ -109,7 +124,7 @@ async def toggle_auto():
     status = "ENABLED" if auto_scan_enabled else "DISABLED"
     
     if auto_scan_enabled:
-        await send_telegram(f"✅ <b>Kalshi SixFilter Activated</b>\n\nAuto-scanner: {status}\nMonitoring markets...")
+        await send_telegram(f"✅ <b>Kalshi SixFilter Activated</b>\n\nAuto-scanner: {status}")
     
     return {
         "success": True,
@@ -169,18 +184,36 @@ input { width: 100%; padding: 12px; background: #0a0a0a; border: 1px solid #2d2d
 .alert-error { background: rgba(255,71,87,0.1); border: 1px solid #ff4757; color: #ff4757; }
 .btn-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 15px; }
 .kill-switch { background: #ff4757; color: #fff; padding: 20px; text-align: center; font-weight: bold; border-radius: 12px; cursor: pointer; margin-top: 20px; }
+.threshold-slider { width: 100%; margin: 10px 0; accent-color: #00d9ff; height: 8px; }
+.threshold-label { display: flex; justify-content: space-between; font-size: 0.75rem; color: #666; margin-top: 5px; }
+.threshold-desc { margin-top: 8px; font-size: 0.85rem; padding: 8px; border-radius: 6px; background: #0a0a0a; }
 </style>
 </head>
 <body>
 <h1>🔮 Kalshi SixFilter</h1>
-<p class="subtitle">MIT 6-Filter Strategy</p>
+<p class="subtitle">Adjustable Confidence Threshold</p>
 
 <div id="alertBox"></div>
 
+<!-- THRESHOLD SLIDER -->
 <div class="card">
-    <div class="card-header" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
-        <span style="font-weight: 600;">📊 Manual Analysis</span>
+    <div style="margin-bottom: 10px; font-weight: 600;">🎛️ Confidence Threshold</div>
+    <div style="text-align: center; margin-bottom: 10px;">
+        <span style="color: #00d9ff; font-size: 1.5rem; font-weight: bold;" id="thresholdValue">6</span>
+        <span style="color: #888;">/6 filters required</span>
     </div>
+    <input type="range" id="thresholdSlider" min="1" max="6" value="6" class="threshold-slider" oninput="updateThreshold()">
+    <div class="threshold-label">
+        <span>Lenient (1)</span>
+        <span>Strict (6)</span>
+    </div>
+    <div id="thresholdDesc" class="threshold-desc" style="color: #00ff88;">
+        ✅ CONSERVATIVE: All 6 filters (your 3-for-3 method)
+    </div>
+</div>
+
+<div class="card">
+    <div style="font-weight: 600; margin-bottom: 15px;">📊 Market Input</div>
     <input type="text" id="marketId" placeholder="Market ID (e.g. FED-25BP-MAY26)">
     <input type="text" id="marketName" placeholder="Market Name">
     <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
@@ -194,6 +227,7 @@ input { width: 100%; padding: 12px; background: #0a0a0a; border: 1px solid #2d2d
         <h3 id="resultTitle" style="margin-bottom: 10px;"></h3>
         <div id="filtersDisplay" class="filters"></div>
         <div id="resultDetails"></div>
+        <div id="thresholdInfo" style="margin-top: 10px; padding: 8px; background: #0a0a0a; border-radius: 6px; font-size: 0.85rem;"></div>
         <button id="executeBtn" class="btn btn-success hidden" onclick="executeTrade()">Execute on Kalshi.com</button>
     </div>
 </div>
@@ -214,7 +248,30 @@ input { width: 100%; padding: 12px; background: #0a0a0a; border: 1px solid #2d2d
 
 <script>
 let currentSignal = null;
+let currentThreshold = 6;
 const API_URL = window.location.origin;
+
+const thresholdDescriptions = {
+    1: { text: "⚠️ AGGRESSIVE: Any 1 filter passes (high volume, lower quality)", color: "#ff4757" },
+    2: { text: "📈 SPECULATIVE: 2/6 filters (early signals, more false positives)", color: "#ffa502" },
+    3: { text: "⚖️ MODERATE: Half filters (balanced approach)", color: "#ffa502" },
+    4: { text: "🎯 SELECTIVE: 4/6 filters (quality over quantity)", color: "#00d9ff" },
+    5: { text: "🔍 STRICT: 5/6 filters (high confidence only)", color: "#00ff88" },
+    6: { text: "✅ CONSERVATIVE: All 6 filters (your current 3-for-3 method)", color: "#00ff88" }
+};
+
+function updateThreshold() {
+    const slider = document.getElementById('thresholdSlider');
+    const valueDisplay = document.getElementById('thresholdValue');
+    const desc = document.getElementById('thresholdDesc');
+    
+    currentThreshold = parseInt(slider.value);
+    valueDisplay.textContent = currentThreshold;
+    
+    const config = thresholdDescriptions[currentThreshold];
+    desc.textContent = config.text;
+    desc.style.color = config.color;
+}
 
 function showAlert(msg, type) {
     const box = document.getElementById('alertBox');
@@ -233,7 +290,10 @@ async function analyze() {
             return;
         }
         
-        const res = await fetch(API_URL + '/kalshi/analyze', {
+        // Include threshold in URL
+        const url = API_URL + '/kalshi/analyze?min_filters=' + currentThreshold;
+        
+        const res = await fetch(url, {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({
@@ -273,6 +333,11 @@ async function analyze() {
             '</div>' +
             '<div style="margin-top: 10px; color: #888; font-size: 0.85rem;">' + result.reason + '</div>';
         
+        // Show threshold info
+        document.getElementById('thresholdInfo').innerHTML = 
+            '<b>Threshold:</b> ' + result.filters_needed + 
+            '<br><small>Required: ' + result.threshold + '/6 filters</small>';
+        
         const execBtn = document.getElementById('executeBtn');
         execBtn.classList.toggle('hidden', !result.proceed);
         
@@ -295,7 +360,6 @@ async function toggleAuto() {
         if (!res.ok) throw new Error('Server error ' + res.status);
         const data = await res.json();
         
-        // FIX: Use correct element ID 'scannerStatus' not 'autoStatus'
         const scannerEl = document.getElementById('scannerStatus');
         scannerEl.innerHTML = data.auto_scan ? 
             '<span class="status-indicator status-on"></span>ON' : 
@@ -304,7 +368,6 @@ async function toggleAuto() {
         showAlert(data.message, data.auto_scan ? 'success' : 'info');
     } catch (e) {
         showAlert('Error: ' + e.message, 'error');
-        console.error(e);
     }
 }
 
@@ -341,7 +404,8 @@ function emergencyStop() {
     }
 }
 
-// Load status on start
+// Initialize
+updateThreshold();
 checkStatus();
 </script>
 </body>
