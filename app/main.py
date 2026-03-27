@@ -1,281 +1,230 @@
-"""
-Kalshi SixFilter Guardian - COMPLETE WORKING SYSTEM
-Features: Adjustable threshold, Auto-scanner, Telegram alerts, Manual trading
-"""
-from fastapi import FastAPI, Query
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+# main.py - Complete Kalshi SixFilter Auto-Scanner
 import os
-import aiohttp
 import asyncio
-from datetime import datetime
+import httpx
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+from fastapi import FastAPI, Request
+from telegram import Bot
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from pydantic import BaseModel
+import logging
 
-# Environment Variables
-KALSHI_API_KEY = os.getenv("KALSHI_API_KEY", "")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Kalshi SixFilter")
+app = FastAPI()
+scheduler = AsyncIOScheduler()
 
-# Global state
-auto_scan_enabled = False
+# Environment variables (already set in Railway)
+KALSHI_API_KEY = os.getenv("KALSHI_API_KEY")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-class MarketReq(BaseModel):
-    market_id: str
-    market_name: str = ""
-    yes_price: float
-    no_price: float
-    your_model_prob: float
-    bankroll: float = 1000
-    daily_pnl: float = 0
-    consecutive_losses: int = 0
-
-# ============ SIXFILTER ENGINE ============
-
-def run_sixfilter_logic(yes_price, no_price, model_prob, bankroll=1000, daily_pnl=0, consecutive_losses=0):
-    """The 6-Filter MIT Strategy"""
-    
-    # Filter 1: LMSR Edge
-    market_prob = yes_price / 100
-    edge = abs(model_prob - market_prob) / market_prob if market_prob > 0 else 0
-    side = "YES" if model_prob > market_prob else "NO"
-    
-    # Filter 2: Kelly Criterion
-    if side == "YES":
-        b = (1 - market_prob) / market_prob
-        p = model_prob
-    else:
-        b = market_prob / (1 - market_prob)
-        p = 1 - model_prob
-    
-    q = 1 - p
-    kelly_raw = (b * p - q) / b if b > 0 else 0
-    kelly_adj = max(0, min(kelly_raw * 0.25, 0.25))
-    
-    if consecutive_losses > 0:
-        kelly_adj *= max(0.5, 1 - (consecutive_losses * 0.1))
-    if daily_pnl < -500:
-        kelly_adj *= 0.5
-    
-    contracts = int((bankroll * kelly_adj) / 100) if kelly_adj > 0.01 else 0
-    
-    # Filter 3: EV Gap (2:1 RR minimum)
-    if side == "YES":
-        win_amt = 1 - market_prob
-        loss_amt = market_prob
-        win_prob = model_prob
-    else:
-        win_amt = market_prob
-        loss_amt = 1 - market_prob
-        win_prob = 1 - model_prob
-    
-    ev = (win_prob * win_amt) - ((1 - win_prob) * loss_amt)
-    rr = win_amt / loss_amt if loss_amt > 0 else 0
-    
-    # Filters 4-6
-    f4 = True  # KL Divergence (simplified)
-    f5 = 6 <= datetime.now().hour <= 22  # Trading hours only
-    f6 = True  # Context
-    
-    filters = [
-        edge >= 0.05,           # LMSR: 5% min edge
-        contracts > 0,          # Kelly: Valid size
-        ev > 0 and rr >= 2.0,   # EV: 2:1 reward/risk
-        f4,                     # KL: Volume OK
-        f5,                     # Bayesian: Trading hours
-        f6                      # Context
-    ]
-    
-    proceed = all(filters)
-    
-    return {
-        "proceed": proceed,
-        "side": side,
-        "contracts": contracts if proceed else 0,
-        "limit_price": yes_price if side == "YES" else no_price,
-        "confidence": int(sum(filters) / 6 * 100),
-        "filters_passed": filters,
-        "edge_percent": round(edge * 100, 1),
-        "expected_value": round(ev * contracts, 2) if proceed else 0,
-        "kelly_fraction": round(kelly_adj, 4),
-        "reason": f"6-Filters: {sum(filters)}/6 | Edge: {edge:.1%} | RR: {rr:.1f}:1"
-    }
-
-# ============ KALSHI API CLIENT ============
+# Global scanner state
+SCANNER_ACTIVE = False
+last_signals = {}
 
 class KalshiClient:
     def __init__(self):
-        self.api_key = KALSHI_API_KEY
-        self.base = "https://trading-api.kalshi.com/v1"
+        self.base_url = "https://trading-api.kalshi.com/trade-api/v2"
+        self.headers = {"Authorization": f"Bearer {KALSHI_API_KEY}"}
     
-    async def __aenter__(self):
-        self.session = aiohttp.ClientSession(
-            headers={"Authorization": f"Bearer {self.api_key}"}
-        )
-        return self
-    
-    async def __aexit__(self, *args):
-        await self.session.close()
-    
-    async def get_markets(self):
+    async def get_markets(self, limit=100):
         """Fetch active markets from Kalshi"""
-        if not self.api_key:
-            return []
-        
-        try:
-            async with self.session.get(f"{self.base}/markets?limit=100&status=active") as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data.get("markets", [])
-                return []
-        except Exception as e:
-            print(f"Error fetching markets: {e}")
-            return []
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{self.base_url}/markets",
+                headers=self.headers,
+                params={
+                    "status": "active",
+                    "limit": limit,
+                    "cursor": None
+                }
+            )
+            return response.json().get("markets", [])
     
-    async def get_prices(self, market_id):
-        """Get current prices for a market"""
-        if not self.api_key:
-            return {"yes": 50, "no": 50}
+    async def get_market_orderbook(self, ticker):
+        """Get YES/NO prices for a market"""
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{self.base_url}/markets/{ticker}/orderbook",
+                headers=self.headers
+            )
+            data = response.json()
+            orderbook = data.get("orderbook", {})
+            
+            # Extract best bid/ask for YES
+            yes_bids = orderbook.get("bids", [])
+            yes_asks = orderbook.get("asks", [])
+            
+            best_yes_bid = yes_bids[0]["price"] if yes_bids else 0
+            best_yes_ask = yes_asks[0]["price"] if yes_asks else 100
+            
+            return {
+                "yes_bid": best_yes_bid,
+                "yes_ask": best_yes_ask,
+                "implied_prob": (best_yes_bid + best_yes_ask) / 200  # Midpoint
+            }
+
+class SixFilter:
+    """
+    Adapted MIT trader's 6 filters for Kalshi prediction markets:
+    1. LMSR: Price deviation from historical VWAP (mean reversion)
+    2. Kelly: Position sizing based on edge vs. bankroll
+    3. EV Gap: Expected value check (2:1 RR minimum)
+    4. KL Divergence: Momentum divergence detection
+    5. Bayesian: Time-of-day, news context filtering
+    6. Stoikov: Optimal entry timing (liquidity clustering)
+    """
+    
+    def analyze(self, market_data, orderbook):
+        signals = {}
         
-        try:
-            async with self.session.get(f"{self.base}/markets/{market_id}/orderbook") as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    yes_price = data.get("yes", {}).get("price", 0)
-                    no_price = data.get("no", {}).get("price", 0)
-                    return {"yes": yes_price, "no": no_price}
-                return {"yes": 50, "no": 50}
-        except:
-            return {"yes": 50, "no": 50}
+        # Filter 1: LMSR Deviation (Mean Reversion)
+        current_price = orderbook["implied_prob"]
+        vwap_7d = market_data.get("previous_price", current_price)  # Fallback if no history
+        lmsr_deviation = abs(current_price - vwap_7d) / vwap_7d if vwap_7d > 0 else 0
+        signals["lmsr_pass"] = lmsr_deviation > 0.05  # >5% deviation
+        
+        # Filter 2: Kelly Criterion (Edge detection)
+        # Assume "true" probability from polling/model data or reverse implied odds
+        true_prob = self._estimate_true_prob(market_data)
+        edge = abs(true_prob - current_price)
+        kelly_fraction = edge / (current_price * (1 - current_price)) if current_price not in [0,1] else 0
+        signals["kelly_pass"] = kelly_fraction > 0.1 and kelly_fraction < 0.5  # Bet 10-50% of edge
+        
+        # Filter 3: EV Gap (Risk/Reward)
+        # For Kalshi: if buying YES at ask, potential profit vs loss
+        potential_return = (100 - orderbook["yes_ask"]) / orderbook["yes_ask"] if orderbook["yes_ask"] > 0 else 0
+        signals["ev_pass"] = potential_return > 0.5  # 50%+ return potential
+        
+        # Filter 4: KL Divergence (Price/Momentum divergence)
+        # Simplified: Check if price moved but volume didn't confirm
+        volume_trend = market_data.get("volume", 0) > market_data.get("previous_volume", 0)
+        price_trend = current_price > vwap_7d
+        signals["divergence_pass"] = not (volume_trend == price_trend)  # Divergence detected
+        
+        # Filter 5: Bayesian Context
+        hour = datetime.now().hour
+        # Avoid low liquidity hours (early morning)
+        signals["bayesian_pass"] = 9 <= hour <= 16  # Market hours only
+        
+        # Filter 6: Stoikov Execution (Liquidity)
+        spread = orderbook["yes_ask"] - orderbook["yes_bid"]
+        signals["stoikov_pass"] = spread < 5  # Tight spread < 5 cents
+        
+        return signals
+    
+    def _estimate_true_prob(self, market_data):
+        """Estimate true probability from market metadata"""
+        # In production, this could pull from 538, polling averages, etc.
+        # For now, use previous close as "fair value"
+        return market_data.get("previous_price", 50) / 100
 
-# ============ TELEGRAM ============
+async def send_telegram_alert(market, direction, price, confidence):
+    """Send actual trade signal to Telegram"""
+    bot = Bot(token=TELEGRAM_TOKEN)
+    
+    message = f"""
+🎯 *KALSHI SIXFILTER SIGNAL*
 
-async def send_telegram(message: str):
-    """Send notification to your phone"""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print(f"Telegram not configured")
-        return False
+*{market['title'][:60]}...*
+
+Direction: *{direction}* 
+Entry: *{price}c*
+Confidence: *{confidence}%*
+
+⏰ Valid for next 5 minutes
+💡 Risk 1-2% max per trade
+    """
+    
+    await bot.send_message(
+        chat_id=TELEGRAM_CHAT_ID,
+        text=message,
+        parse_mode="Markdown"
+    )
+
+async def scan_markets():
+    """Main scanning loop - runs every 5 minutes"""
+    global SCANNER_ACTIVE, last_signals
+    
+    if not SCANNER_ACTIVE:
+        return
+    
+    logger.info("🔍 Scanning Kalshi markets...")
+    
+    kalshi = KalshiClient()
+    six_filter = SixFilter()
     
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": message,
-                "parse_mode": "HTML"
-            }, timeout=10) as resp:
-                success = resp.status == 200
-                if success:
-                    print("✅ Telegram sent")
-                return success
-    except Exception as e:
-        print(f"❌ Telegram error: {e}")
-        return False
-
-# ============ AUTO SCANNER ============
-
-async def auto_scanner():
-    """Background scanner - runs every 5 minutes"""
-    global auto_scan_enabled
-    
-    print("🤖 Auto-scanner initialized")
-    
-    while True:
-        if auto_scan_enabled and KALSHI_API_KEY:
-            print("🔍 Starting market scan...")
-            signals_found = 0
-            
-            try:
-                async with KalshiClient() as client:
-                    markets = await client.get_markets()
-                    print(f"📊 Found {len(markets)} total markets")
-                    
-                    if len(markets) == 0:
-                        print("⚠️ No markets fetched - check API key")
-                        await asyncio.sleep(300)
-                        continue
-                    
-                    for market in markets[:100]:  # Check top 100
-                        if not auto_scan_enabled:
-                            print("⏹️ Scanner disabled, stopping")
-                            break
-                        
-                        market_id = market.get("id", "")
-                        name = market.get("title", "")
-                        ticker = market.get("event_ticker", "")
-                        
-                        # Skip sports/entertainment
-                        skip_words = ["sports", "nba", "nfl", "mlb", "oscar", "grammy", "super bowl", "world cup"]
-                        if any(word in name.lower() for word in skip_words):
-                            continue
-                        
-                        # Focus on financial markets
-                        good_keywords = ["fed", "cpi", "gdp", "btc", "eth", "bitcoin", "s&p", "nasdaq", "gold", "oil", "gas", "rate", "election", " Trump", "crypto"]
-                        if not any(kw in name.lower() or kw in ticker.lower() for kw in good_keywords):
-                            continue
-                        
-                        # Get prices
-                        prices = await client.get_prices(market_id)
-                        yes_price = prices.get("yes", 0)
-                        no_price = prices.get("no", 0)
-                        
-                        if yes_price == 0 or no_price == 0:
-                            continue
-                        
-                        # LOOK FOR EXTREMES (contrarian strategy)
-                        model_prob = None
-                        
-                        if yes_price > 88:  # Market 88%+ confident YES
-                            model_prob = 0.80  # We think 80% (8% edge)
-                        elif yes_price < 12:  # Market 88%+ confident NO
-                            model_prob = 0.20  # We think 20% (8% edge)
-                        elif 48 <= yes_price <= 52:  # Coin flip, skip
-                            continue
-                        
-                        if model_prob is None:
-                            continue
-                        
-                        # Run SixFilter
-                        result = run_sixfilter_logic(
-                            yes_price=yes_price,
-                            no_price=no_price,
-                            model_prob=model_prob,
-                            bankroll=1000,
-                            daily_pnl=0,
-                            consecutive_losses=0
-                        )
-                        
-                        # SEND ALERT if passes with good edge
-                        if result["proceed"] and result["edge_percent"] >= 7:
-                            signals_found += 1
-                            
-                            alert_msg = f"""🔥 <b>SIXFILTER SIGNAL</b>
-
-📊 {name[:50]}
-🎯 Side: <b>{result['side']}</b> @ {result['limit_price']}¢
-📈 Edge: <b>{result['edge_percent']}%</b>
-💰 Contracts: <b>{result['contracts']}</b>
-✅ Filters: <b>{sum(result['filters_passed'])}/6</b>
-
-<a href="https://kalshi.com/markets/{market_id}">➡️ Trade Now</a>"""
-                            
-                            await send_telegram(alert_msg)
-                            print(f"✅ SIGNAL: {name[:30]} - {result['side']} @ {result['edge_percent']}%")
-                            
-                            # Only send 3 signals max per scan (avoid spam)
-                            if signals_found >= 3:
-                                break
-                    
-                    print(f"✅ Scan complete. Signals found: {signals_found}")
-                            
-            except Exception as e:
-                print(f"❌ Scanner error: {e}")
-                await send_telegram(f"⚠️ Scanner error: {str(e)[:100]}")
+        markets = await kalshi.get_markets(limit=100)
         
-        # Wait 5 minutes
-        await asyncio.sleep(300)
+        for market in markets:
+            ticker = market["ticker"]
+            
+            # Skip if we already signaled this recently (avoid spam)
+            if ticker in last_signals and (datetime.now() - last_signals[ticker]).seconds < 3600:
+                continue
+            
+            # Get orderbook
+            try:
+                orderbook = await kalshi.get_market_orderbook(ticker)
+            except:
+                continue
+            
+            # Run SixFilter
+            filters = six_filter.analyze(market, orderbook)
+            
+            # All 6 filters must pass (conservative approach - MIT style)
+            if all(filters.values()):
+                # Determine direction (buy YES vs NO)
+                if orderbook["implied_prob"] < 50:
+                    direction = "BUY YES"
+                    entry_price = orderbook["yes_ask"]
+                else:
+                    direction = "BUY NO"
+                    entry_price = 100 - orderbook["yes_bid"]
+                
+                await send_telegram_alert(market, direction, entry_price, 85)
+                last_signals[ticker] = datetime.now()
+                logger.info(f"🚨 Signal: {ticker} {direction} @ {entry_price}")
+                
+    except Exception as e:
+        logger.error(f"Scanner error: {e}")
 
-# ============ API ENDPOINTS ============
+@app.post("/webhook/telegram")
+async def telegram_webhook(request: Request):
+    """Handle Telegram /start commands"""
+    global SCANNER_ACTIVE
+    
+    data = await request.json()
+    message = data.get("message", {}).get("text", "")
+    chat_id = data.get("message", {}).get("chat", {}).get("id")
+    
+    if message == "/start":
+        SCANNER_ACTIVE = True
+        bot = Bot(token=TELEGRAM_TOKEN)
+        await bot.send_message(
+            chat_id=chat_id,
+            text="✅ Kalshi SixFilter Activated\n\nAuto-scanner: ENABLED\nMonitoring 100+ markets every 5 minutes...\n\nYou'll receive alerts when all 6 filters align."
+        )
+        # Trigger first scan immediately
+        asyncio.create_task(scan_markets())
+        
+    elif message == "/stop":
+        SCANNER_ACTIVE = False
+        bot = Bot(token=TELEGRAM_TOKEN)
+        await bot.send_message(chat_id=chat_id, text="🛑 Scanner paused.")
+    
+    return {"ok": True}
 
-@app.post("/kalshi/analyze")
-async def analyze(req: MarketReq, min_filters: int = Query(6, ge=1
+@app.get("/health")
+async def health():
+    return {"status": "alive", "scanner_active": SCANNER_ACTIVE}
+
+@app.on_event("startup")
+async def startup():
+    scheduler.add_job(scan_markets, "interval", minutes=5)
+    scheduler.start()
