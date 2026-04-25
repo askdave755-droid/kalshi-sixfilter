@@ -6,3 +6,10 @@ apscheduler==3.10.4
 pandas==2.1.3
 numpy==1.26.2
 pydantic==2.5.0
+
+# ─── SixFilter Kalshi Bridge ───
+pykalshi>=0.2.0
+scipy>=1.10.0
+asyncpg>=0.29.0
+websocket-client>=1.6.0
+aiohttp>=3.9.0
