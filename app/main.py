@@ -1,229 +1,232 @@
+"""
+SixFilter Guardian → Kalshi Bridge
+Paste into: app/kalshi_trader.py
+"""
+
 import os
-import asyncio
-import httpx
-import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
-from telegram import Bot
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from pydantic import BaseModel
 import logging
+from datetime import datetime
+from typing import Optional, Dict, List
+from dataclasses import dataclass, field
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+import numpy as np
+from scipy.stats import norm
+from pykalshi import KalshiClient
+from pykalshi.models import CreateOrderRequest, OrderSide, OrderType
 
-app = FastAPI()
-scheduler = AsyncIOScheduler()
+logger = logging.getLogger('kalshi_trader')
 
-# Environment variables
-KALSHI_API_KEY = os.getenv("KALSHI_API_KEY")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+# ─── CONFIG ───
+@dataclass
+class SixFilterConfig:
+    MIN_EDGE_PCT: float = 4.0
+    MAX_EDGE_PCT: float = 25.0
+    KELLY_FRACTION: float = 0.25
+    MAX_POSITION_PCT: float = 0.05
+    MIN_POSITION_DOLLARS: float = 10.0
+    MIN_EV_CENTS: float = 2.0
+    MAX_KL_SCORE: float = 2.0
+    MIN_CONTEXT_SCORE: float = 0.5
+    MAX_SPREAD_CENTS: float = 5.0
+    MAKER_DISCOUNT: int = 1
+    BANKROLL: float = 10000.0
+    MAX_DAILY_LOSS_PCT: float = 0.05
+    MAX_OPEN_POSITIONS: int = 10
+    TARGET_CATEGORIES: List[str] = field(default_factory=lambda: ['economics', 'finance'])
 
-# Global scanner state
-SCANNER_ACTIVE = False
-last_signals = {}
+# ─── SIX FILTER ENGINE ───
+class SixFilterEngine:
+    def __init__(self, config: SixFilterConfig):
+        self.config = config
+        self.distribution_params = {
+            'mean': 0.249,
+            'std': 0.156,
+            'recent_mean': 0.255,
+            'recent_std': 0.141,
+            'seasonal_mean': 0.234,
+            'seasonal_std': 0.187
+        }
 
-# Serve the dashboard at root
-@app.get("/", response_class=HTMLResponse)
-async def dashboard():
-    """Serve the dashboard HTML from parent directory"""
-    try:
-        # dashboard.html is in root, main.py is in app/, so go up one level
-        dashboard_path = os.path.join(os.path.dirname(__file__), "..", "dashboard.html")
-        dashboard_path = os.path.abspath(dashboard_path)
-        
-        if os.path.exists(dashboard_path):
-            with open(dashboard_path, "r") as f:
-                return f.read()
+    def filter_1_lmsr(self, threshold: float, kalshi_yes_price: float):
+        mu = self.distribution_params['mean']
+        sigma = self.distribution_params['std']
+        true_prob = (1 - norm.cdf(threshold, mu, sigma)) * 100
+        edge = true_prob - kalshi_yes_price
+        passed = abs(edge) > self.config.MIN_EDGE_PCT and abs(edge) < self.config.MAX_EDGE_PCT
+        return passed, edge, true_prob
+
+    def filter_2_kelly(self, edge: float, price_cents: float, side: str):
+        if abs(edge) < self.config.MIN_EDGE_PCT:
+            return False, 0.0, 0.0
+        if side == 'yes':
+            b = (100 - price_cents) / price_cents
+            p = (price_cents + edge) / 100
         else:
-            return f"""
-            <html>
-                <body style="font-family: Arial, sans-serif; padding: 40px; background: #0f172a; color: white;">
-                    <h1>🎯 Kalshi SixFilter</h1>
-                    <p>Status: {'✅ Active' if SCANNER_ACTIVE else '⏸️ Paused'}</p>
-                    <p>API: Running</p>
-                    <p>Send /start to your Telegram bot to activate scanner</p>
-                    <br>
-                    <a href="/health" style="color: #3b82f6;">Check Health →</a>
-                </body>
-            </html>
-            """
-    except Exception as e:
-        return f"<h1>Error</h1><p>{str(e)}</p>"
+            b = price_cents / (100 - price_cents)
+            p = (100 - price_cents + edge) / 100
+        q = 1 - p
+        kelly = (b * p - q) / b if b > 0 else 0
+        kelly = max(0, min(kelly, 0.25))
+        position = self.config.BANKROLL * kelly * self.config.KELLY_FRACTION
+        position = min(position, self.config.BANKROLL * self.config.MAX_POSITION_PCT)
+        passed = position >= self.config.MIN_POSITION_DOLLARS
+        return passed, kelly, position
 
-@app.get("/health")
-async def health():
-    return {"status": "alive", "scanner_active": SCANNER_ACTIVE, "time": datetime.now().isoformat()}
+    def filter_3_ev(self, true_prob: float, cost_cents: float, side: str):
+        win_prob = true_prob / 100 if side == 'yes' else 1 - (true_prob / 100)
+        payout = 100 - cost_cents
+        p = cost_cents / 100
+        fee_per_side = np.ceil(0.07 * p * (1 - p) * 100) / 100
+        total_fee = fee_per_side * 2
+        ev = (win_prob * payout) - cost_cents - total_fee
+        passed = ev > self.config.MIN_EV_CENTS
+        return passed, ev
 
-class KalshiClient:
+# ─── KALSHI TRADER ───
+class KalshiTrader:
     def __init__(self):
-        self.base_url = "https://trading-api.kalshi.com/trade-api/v2"
-        self.headers = {"Authorization": f"Bearer {KALSHI_API_KEY}"}
-    
-    async def get_markets(self, limit=100):
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{self.base_url}/markets",
-                headers=self.headers,
-                params={"status": "active", "limit": limit}
-            )
-            return response.json().get("markets", [])
-    
-    async def get_market_orderbook(self, ticker):
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{self.base_url}/markets/{ticker}/orderbook",
-                headers=self.headers
-            )
-            data = response.json()
-            orderbook = data.get("orderbook", {})
-            yes_bids = orderbook.get("bids", [])
-            yes_asks = orderbook.get("asks", [])
-            
-            best_yes_bid = yes_bids[0]["price"] if yes_bids else 0
-            best_yes_ask = yes_asks[0]["price"] if yes_asks else 100
-            
-            return {
-                "yes_bid": best_yes_bid,
-                "yes_ask": best_yes_ask,
-                "implied_prob": (best_yes_bid + best_yes_ask) / 200
-            }
+        self.config = SixFilterConfig()
+        self.engine = SixFilterEngine(self.config)
 
-class SixFilter:
-    def analyze(self, market_data, orderbook):
-        signals = {}
-        current_price = orderbook["implied_prob"]
-        vwap_7d = market_data.get("previous_price", current_price)
-        
-        # Filter 1: LMSR Deviation
-        lmsr_deviation = abs(current_price - vwap_7d) / vwap_7d if vwap_7d > 0 else 0
-        signals["lmsr_pass"] = lmsr_deviation > 0.05
-        
-        # Filter 2: Kelly Criterion
-        true_prob = self._estimate_true_prob(market_data)
-        edge = abs(true_prob - current_price)
-        kelly = edge / (current_price * (1 - current_price)) if current_price not in [0,1] else 0
-        signals["kelly_pass"] = 0.1 < kelly < 0.5
-        
-        # Filter 3: EV Gap (2:1 RR minimum)
-        potential_return = (100 - orderbook["yes_ask"]) / orderbook["yes_ask"] if orderbook["yes_ask"] > 0 else 0
-        signals["ev_pass"] = potential_return > 0.5
-        
-        # Filter 4: Divergence
-        volume_trend = market_data.get("volume", 0) > market_data.get("previous_volume", 0)
-        price_trend = current_price > vwap_7d
-        signals["divergence_pass"] = volume_trend != price_trend
-        
-        # Filter 5: Bayesian (market hours only)
-        hour = datetime.now().hour
-        signals["bayesian_pass"] = 9 <= hour <= 16
-        
-        # Filter 6: Stoikov (liquidity)
-        spread = orderbook["yes_ask"] - orderbook["yes_bid"]
-        signals["stoikov_pass"] = spread < 5
-        
-        return signals
-    
-    def _estimate_true_prob(self, market_data):
-        return market_data.get("previous_price", 50) / 100
+        key_id = os.getenv("KALSHI_KEY_ID") or os.getenv("KALSHI_API_KEY")
+        priv_key = os.getenv("KALSHI_PRIVATE_KEY")
+        priv_path = os.getenv("KALSHI_PRIVATE_KEY_PATH")
 
-async def send_telegram_alert(market, direction, price, confidence):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("Telegram not configured")
-        return
-    
-    bot = Bot(token=TELEGRAM_TOKEN)
-    message = f"""
-🎯 *KALSHI SIXFILTER SIGNAL*
+        if not key_id:
+            raise ValueError("KALSHI_KEY_ID or KALSHI_API_KEY not set")
 
-*{market['title'][:50]}...*
+        if priv_key:
+            self.client = KalshiClient(key_id=key_id, private_key=priv_key)
+        elif priv_path:
+            self.client = KalshiClient(key_id=key_id, private_key_path=priv_path)
+        else:
+            raise ValueError("KALSHI_PRIVATE_KEY or KALSHI_PRIVATE_KEY_PATH required")
 
-Direction: *{direction}* 
-Entry: *{price}c*
-Confidence: *{confidence}%*
+        self.running = False
 
-⏰ Valid for 5 minutes
-💡 Risk 1-2% max per trade
-    """
-    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode="Markdown")
-
-async def scan_markets():
-    global SCANNER_ACTIVE, last_signals
-    
-    if not SCANNER_ACTIVE:
-        return
-    
-    logger.info("🔍 Scanning Kalshi markets...")
-    
-    kalshi = KalshiClient()
-    six_filter = SixFilter()
-    
-    try:
-        markets = await kalshi.get_markets(limit=100)
-        logger.info(f"Found {len(markets)} markets")
-        
-        for market in markets:
-            ticker = market["ticker"]
-            
-            if ticker in last_signals and (datetime.now() - last_signals[ticker]).seconds < 3600:
-                continue
-            
+    def scan_markets(self):
+        markets = []
+        for category in self.config.TARGET_CATEGORIES:
             try:
-                orderbook = await kalshi.get_market_orderbook(ticker)
+                events = self.client.get_events(category=category, status='open')
+                for event in events.events:
+                    for market in event.markets:
+                        threshold = self._extract_threshold(market.title)
+                        markets.append({
+                            'ticker': market.ticker,
+                            'title': market.title,
+                            'yes_ask': market.yes_ask,
+                            'yes_bid': market.yes_bid,
+                            'no_ask': market.no_ask,
+                            'no_bid': market.no_bid,
+                            'volume': market.volume,
+                            'close_date': str(market.close_date) if market.close_date else None,
+                            'threshold': threshold,
+                            'spread': market.yes_ask - market.yes_bid
+                        })
             except Exception as e:
-                continue
-            
-            filters = six_filter.analyze(market, orderbook)
-            passed = sum(filters.values())
-            logger.info(f"{ticker}: {passed}/6 filters passed")
-            
-            if all(filters.values()):
-                if orderbook["implied_prob"] < 50:
-                    direction = "BUY YES"
-                    entry_price = orderbook["yes_ask"]
-                else:
-                    direction = "BUY NO"
-                    entry_price = 100 - orderbook["yes_bid"]
-                
-                await send_telegram_alert(market, direction, entry_price, 85)
-                last_signals[ticker] = datetime.now()
-                logger.info(f"🚨 SIGNAL: {ticker} {direction} @ {entry_price}")
-                
-    except Exception as e:
-        logger.error(f"Scanner error: {e}")
+                logger.error(f"Scan error: {e}")
+        return markets
 
-@app.post("/webhook/telegram")
-async def telegram_webhook(request: Request):
-    global SCANNER_ACTIVE
-    
-    data = await request.json()
-    message = data.get("message", {}).get("text", "")
-    chat_id = data.get("message", {}).get("chat", {}).get("id")
-    
-    if not TELEGRAM_TOKEN:
-        return {"error": "Telegram not configured"}
-    
-    bot = Bot(token=TELEGRAM_TOKEN)
-    
-    if message == "/start":
-        SCANNER_ACTIVE = True
-        await bot.send_message(
-            chat_id=chat_id,
-            text="✅ Kalshi SixFilter Activated\n\nAuto-scanner: ENABLED\nMonitoring 100+ markets every 5 minutes...\n\nYou'll receive alerts when all 6 filters align."
-        )
-        asyncio.create_task(scan_markets())
-        
-    elif message == "/stop":
-        SCANNER_ACTIVE = False
-        await bot.send_message(chat_id=chat_id, text="🛑 Scanner paused.")
-    
-    return {"ok": True}
+    def _extract_threshold(self, title: str) -> Optional[float]:
+        import re
+        patterns = [r'>(\\d+\\.\\d+)%', r'above\\s+(\\d+\\.\\d+)%', r'(\\d+\\.\\d+)%\\s+or\\s+more']
+        for pattern in patterns:
+            match = re.search(pattern, title.lower())
+            if match:
+                return float(match.group(1))
+        return None
 
-@app.on_event("startup")
-async def startup():
-    scheduler.add_job(scan_markets, "interval", minutes=5)
-    scheduler.start()
-    logger.info("✅ Server started, scheduler running")
+    def evaluate_market(self, market: Dict) -> Optional[Dict]:
+        if market['threshold'] is None:
+            return None
+
+        threshold = market['threshold']
+        yes_price = market['yes_ask']
+        no_price = market['no_ask']
+        spread = market['spread']
+
+        f1_pass, edge, true_prob = self.engine.filter_1_lmsr(threshold, yes_price)
+
+        if edge > 0:
+            side, trade_price, trade_edge = 'yes', yes_price, edge
+        elif edge < 0:
+            side, trade_price, trade_edge = 'no', no_price, abs(edge)
+        else:
+            return None
+
+        f2_pass, kelly, position = self.engine.filter_2_kelly(trade_edge, trade_price, side)
+        cost = trade_price if side == 'yes' else (100 - trade_price)
+        f3_pass, ev = self.engine.filter_3_ev(true_prob, cost, side)
+
+        f4_pass = True
+        f5_pass = True
+        f6_pass = spread < self.config.MAX_SPREAD_CENTS
+
+        all_pass = all([f1_pass, f2_pass, f3_pass, f4_pass, f5_pass, f6_pass])
+
+        if not all_pass:
+            return None
+
+        contract_cost = trade_price / 100
+        count = int(position / contract_cost)
+        if count < 1:
+            return None
+
+        return {
+            'ticker': market['ticker'],
+            'title': market['title'],
+            'side': side,
+            'price': trade_price - self.config.MAKER_DISCOUNT if side == 'no' else trade_price + self.config.MAKER_DISCOUNT,
+            'count': count,
+            'edge': round(trade_edge, 2),
+            'true_prob': round(true_prob if side == 'yes' else (100 - true_prob), 2),
+            'kalshi_prob': trade_price,
+            'ev': round(ev, 2),
+            'kelly': round(kelly, 4),
+            'position': round(position, 2),
+            'filters': {
+                'lmsr': f1_pass, 'kelly': f2_pass, 'ev': f3_pass,
+                'kl': f4_pass, 'bayesian': f5_pass, 'stoikov': f6_pass
+            }
+        }
+
+    def execute_trade(self, signal: Dict) -> Optional[str]:
+        try:
+            order = CreateOrderRequest(
+                ticker=signal['ticker'],
+                side=OrderSide.YES if signal['side'] == 'yes' else OrderSide.NO,
+                type=OrderType.LIMIT,
+                price=int(signal['price']),
+                count=signal['count']
+            )
+            response = self.client.create_order(order)
+            logger.info(f"EXECUTED: {signal['title']} | {signal['side'].upper()} @ {signal['price']}¢ | {signal['count']} contracts")
+            return response.order_id
+        except Exception as e:
+            logger.error(f"Execution failed: {e}")
+            return None
+
+    def run_cycle(self) -> List[Dict]:
+        markets = self.scan_markets()
+        signals = []
+
+        for market in markets:
+            signal = self.evaluate_market(market)
+            if signal:
+                order_id = self.execute_trade(signal)
+                signal['order_id'] = order_id
+                signal['status'] = 'executed' if order_id else 'failed'
+                signal['timestamp'] = datetime.now().isoformat()
+                signals.append(signal)
+
+        return signals
+
+# Singleton
+_trader: Optional[KalshiTrader] = None
+
+def get_trader() -> KalshiTrader:
+    global _trader
+    if _trader is None:
+        _trader = KalshiTrader()
+    return _trader
