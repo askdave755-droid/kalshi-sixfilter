@@ -8,6 +8,7 @@ import json
 import base64
 import logging
 import requests
+import textwrap
 from datetime import datetime
 from typing import Optional, Dict, List
 from dataclasses import dataclass, field
@@ -91,7 +92,6 @@ class KalshiHTTPClient:
         self.key_id = os.getenv("KALSHI_KEY_ID") or os.getenv("KALSHI_API_KEY") or ""
         self.env = os.getenv("KALSHI_ENV", "demo")
         
-        # FIXED: Base URL without API version - version goes in path
         if self.env == "demo":
             self.base = "https://external-api.demo.kalshi.co"
         else:
@@ -102,12 +102,41 @@ class KalshiHTTPClient:
         priv_path = os.getenv("KALSHI_PRIVATE_KEY_PATH")
 
         if priv_text:
-            # Handle Railway's various newline encodings
-            key_data = priv_text.replace("\\n", "\n").strip().encode()
-            self._load_key(key_data)
+            fixed = self._fix_pem(priv_text)
+            self._load_key(fixed.encode())
         elif priv_path and os.path.exists(priv_path):
             with open(priv_path, "rb") as f:
                 self._load_key(f.read())
+
+    def _fix_pem(self, text: str) -> str:
+        """Auto-fix PEM that lost newlines during copy-paste"""
+        text = text.strip()
+        # Convert literal \n strings to real newlines
+        text = text.replace("\\n", "\n")
+        
+        # If already properly formatted, return as-is
+        if "\n" in text and "-----BEGIN" in text and "-----END" in text:
+            return text
+        
+        # If it's one big blob, reconstruct it
+        header = "-----BEGIN RSA PRIVATE KEY-----"
+        footer = "-----END RSA PRIVATE KEY-----"
+        
+        if header not in text or footer not in text:
+            raise ValueError("Missing PEM header or footer")
+        
+        # Extract base64 body
+        body_start = text.index(header) + len(header)
+        body_end = text.index(footer)
+        body = text[body_start:body_end].strip()
+        
+        # Remove any whitespace from body
+        body = body.replace(" ", "").replace("\n", "").replace("\r", "")
+        
+        # Re-wrap at 64 chars
+        wrapped = "\n".join(textwrap.wrap(body, 64))
+        
+        return f"{header}\n{wrapped}\n{footer}\n"
 
     def _load_key(self, data: bytes):
         if not CRYPTO_OK:
@@ -126,7 +155,6 @@ class KalshiHTTPClient:
 
     def _headers(self, method: str, path: str, body: str = "") -> dict:
         ts = str(int(datetime.utcnow().timestamp() * 1000))
-        # FIXED: Path for signing includes /trade-api/v2 prefix
         sign_path = path.split("?")[0]
         msg = ts + method.upper() + sign_path + body
         return {
