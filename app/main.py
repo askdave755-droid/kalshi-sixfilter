@@ -112,7 +112,7 @@ class KalshiHTTPClient:
             return ""
         sig = self.private_key.sign(
             text.encode(),
-            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.AUTO),
+            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
             hashes.SHA256(),
         )
         return base64.b64encode(sig).decode()
@@ -149,6 +149,9 @@ class KalshiHTTPClient:
             params += f"&category={category}"
         return self.get("/trade-api/v2/events" + params)
 
+    def get_markets(self, status: str = "open", limit: int = 100):
+        return self.get(f"/trade-api/v2/markets?status={status}&limit={limit}")
+
     def get_market(self, ticker: str):
         return self.get(f"/trade-api/v2/markets/{ticker}")
 
@@ -179,22 +182,36 @@ class KalshiTrader:
                 data = self.client.get_events(category=category, status="open")
                 for event in data.get("events", []):
                     for m in event.get("markets", []):
-                        threshold = self._extract_threshold(m.get("title", ""))
-                        markets.append({
-                            "ticker": m.get("ticker"),
-                            "title": m.get("title"),
-                            "yes_ask": m.get("yes_ask", 0),
-                            "yes_bid": m.get("yes_bid", 0),
-                            "no_ask": m.get("no_ask", 0),
-                            "no_bid": m.get("no_bid", 0),
-                            "volume": m.get("volume", 0),
-                            "close_date": str(m.get("close_date")) if m.get("close_date") else None,
-                            "threshold": threshold,
-                            "spread": (m.get("yes_ask", 0) or 0) - (m.get("yes_bid", 0) or 0),
-                        })
+                        markets.append(self._normalize_market(m))
             except Exception as e:
-                logger.error(f"Scan error [{category}]: {e}")
+                logger.error(f"Events scan error [{category}]: {e}")
+        if not markets:
+            try:
+                data = self.client.get_markets(status="open", limit=100)
+                for m in data.get("markets", []):
+                    markets.append(self._normalize_market(m))
+            except Exception as e:
+                logger.error(f"Markets scan error: {e}")
         return markets
+
+    def _normalize_market(self, m: dict) -> Dict:
+        threshold = self._extract_threshold(m.get("title", ""))
+        yes_ask = m.get("yes_ask", 0) or 0
+        yes_bid = m.get("yes_bid", 0) or 0
+        no_ask = m.get("no_ask", 0) or 0
+        no_bid = m.get("no_bid", 0) or 0
+        return {
+            "ticker": m.get("ticker"),
+            "title": m.get("title"),
+            "yes_ask": yes_ask,
+            "yes_bid": yes_bid,
+            "no_ask": no_ask,
+            "no_bid": no_bid,
+            "volume": m.get("volume", 0),
+            "close_date": str(m.get("close_date")) if m.get("close_date") else None,
+            "threshold": threshold,
+            "spread": yes_ask - yes_bid,
+        }
 
     def _extract_threshold(self, title: str) -> Optional[float]:
         import re
@@ -202,6 +219,7 @@ class KalshiTrader:
         patterns = [
             r">(\d+\.\d+)%", r"above\s+(\d+\.\d+)%",
             r"(\d+\.\d+)%\s+or\s+more", r"(\d+\.\d+)%\s+or\s+higher",
+            r"(\d+\.\d+)%",
         ]
         for pat in patterns:
             m = re.search(pat, title_lower)
