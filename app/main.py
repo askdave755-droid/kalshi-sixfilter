@@ -7,9 +7,9 @@ import os
 import json
 import base64
 import logging
-import requests
+import time
 import textwrap
-from datetime import datetime
+import requests
 from typing import Optional, Dict, List
 from dataclasses import dataclass, field
 
@@ -111,29 +111,21 @@ class KalshiHTTPClient:
     def _fix_pem(self, text: str) -> str:
         """Auto-fix PEM that lost newlines during copy-paste"""
         text = text.strip()
-        # Convert literal \n strings to real newlines
         text = text.replace("\\n", "\n")
         
-        # If already properly formatted, return as-is
         if "\n" in text and "-----BEGIN" in text and "-----END" in text:
             return text
         
-        # If it's one big blob, reconstruct it
         header = "-----BEGIN RSA PRIVATE KEY-----"
         footer = "-----END RSA PRIVATE KEY-----"
         
         if header not in text or footer not in text:
             raise ValueError("Missing PEM header or footer")
         
-        # Extract base64 body
         body_start = text.index(header) + len(header)
         body_end = text.index(footer)
         body = text[body_start:body_end].strip()
-        
-        # Remove any whitespace from body
         body = body.replace(" ", "").replace("\n", "").replace("\r", "")
-        
-        # Re-wrap at 64 chars
         wrapped = "\n".join(textwrap.wrap(body, 64))
         
         return f"{header}\n{wrapped}\n{footer}\n"
@@ -153,12 +145,18 @@ class KalshiHTTPClient:
         )
         return base64.b64encode(sig).decode()
 
-    def _headers(self, method: str, path: str, body: str = "") -> dict:
-        ts = str(int(datetime.utcnow().timestamp() * 1000))
-        sign_path = path.split("?")[0]
-        msg = ts + method.upper() + sign_path + body
+    def _headers(self, method: str, path: str) -> dict:
+        if not self.key_id:
+            raise RuntimeError("KALSHI_KEY_ID is not set")
+        if not self.private_key:
+            raise RuntimeError("Kalshi private key not loaded")
+        
+        ts = str(int(time.time() * 1000))
+        sign_path = path.split("?", 1)[0]
+        msg = ts + method.upper() + sign_path
+        
         return {
-            "KALSHI-ACCESS-KEY": self.key_id,
+            "KALSHI-ACCESS-KEY": self.key_id.strip(),
             "KALSHI-ACCESS-SIGNATURE": self._sign(msg),
             "KALSHI-ACCESS-TIMESTAMP": ts,
             "Content-Type": "application/json",
@@ -172,8 +170,13 @@ class KalshiHTTPClient:
 
     def post(self, path: str, payload: dict):
         url = self.base + path
-        body = json.dumps(payload)
-        r = requests.post(url, headers=self._headers("POST", path, body), data=body, timeout=15)
+        body = json.dumps(payload, separators=(",", ":"))
+        r = requests.post(
+            url,
+            headers=self._headers("POST", path),
+            data=body,
+            timeout=15,
+        )
         r.raise_for_status()
         return r.json()
 
