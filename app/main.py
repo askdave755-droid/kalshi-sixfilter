@@ -90,7 +90,11 @@ class KalshiHTTPClient:
     def __init__(self):
         self.key_id = os.getenv("KALSHI_KEY_ID") or os.getenv("KALSHI_API_KEY") or ""
         self.env = os.getenv("KALSHI_ENV", "demo")
-        self.base = "https://demo-api.kalshi.co" if self.env == "demo" else "https://api.kalshi.com"
+        # FIXED: Correct Kalshi API URLs
+        if self.env == "demo":
+            self.base = "https://external-api.demo.kalshi.co/trade-api/v2"
+        else:
+            self.base = "https://external-api.kalshi.com/trade-api/v2"
         self.private_key = None
 
         priv_text = os.getenv("KALSHI_PRIVATE_KEY")
@@ -110,15 +114,17 @@ class KalshiHTTPClient:
     def _sign(self, text: str) -> str:
         if not self.private_key:
             return ""
+        # FIXED: DIGEST_LENGTH per Kalshi docs
         sig = self.private_key.sign(
             text.encode(),
-            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
+            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
             hashes.SHA256(),
         )
         return base64.b64encode(sig).decode()
 
     def _headers(self, method: str, path: str, body: str = "") -> dict:
-        ts = str(int(datetime.utcnow().timestamp()))
+        # FIXED: Milliseconds timestamp per Kalshi docs
+        ts = str(int(datetime.utcnow().timestamp() * 1000))
         msg = ts + method.upper() + path + body
         return {
             "KALSHI-ACCESS-KEY": self.key_id,
@@ -141,19 +147,19 @@ class KalshiHTTPClient:
         return r.json()
 
     def get_balance(self):
-        return self.get("/trade-api/v2/portfolio/balance")
+        return self.get("/portfolio/balance")
 
     def get_events(self, category: str = "", status: str = "open"):
         params = f"?status={status}"
         if category:
             params += f"&category={category}"
-        return self.get("/trade-api/v2/events" + params)
+        return self.get("/events" + params)
 
     def get_markets(self, status: str = "open", limit: int = 100):
-        return self.get(f"/trade-api/v2/markets?status={status}&limit={limit}")
+        return self.get(f"/markets?status={status}&limit={limit}")
 
     def get_market(self, ticker: str):
-        return self.get(f"/trade-api/v2/markets/{ticker}")
+        return self.get(f"/markets/{ticker}")
 
     def create_order(self, ticker: str, side: str, price: int, count: int):
         payload = {
@@ -166,7 +172,7 @@ class KalshiHTTPClient:
             "no_price": price if side == "no" else None,
         }
         payload = {k: v for k, v in payload.items() if v is not None}
-        return self.post("/trade-api/v2/portfolio/orders", payload)
+        return self.post("/portfolio/orders", payload)
 
 
 class KalshiTrader:
