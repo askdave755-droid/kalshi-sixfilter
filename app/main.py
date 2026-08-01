@@ -90,19 +90,14 @@ class KalshiHTTPClient:
     def __init__(self):
         self.key_id = os.getenv("KALSHI_KEY_ID") or os.getenv("KALSHI_API_KEY") or ""
         self.env = os.getenv("KALSHI_ENV", "demo")
-        if self.env == "demo":
-            self.base = "https://external-api.demo.kalshi.co/trade-api/v2"
-        else:
-            self.base = "https://external-api.kalshi.com/trade-api/v2"
+        self.base = "https://demo-api.kalshi.co" if self.env == "demo" else "https://api.kalshi.com"
         self.private_key = None
 
         priv_text = os.getenv("KALSHI_PRIVATE_KEY")
         priv_path = os.getenv("KALSHI_PRIVATE_KEY_PATH")
 
         if priv_text:
-            # FIX: Handle \n escape sequences from Railway env var
-            key_data = priv_text.replace("\\n", "\n").encode()
-            self._load_key(key_data)
+            self._load_key(priv_text.encode())
         elif priv_path and os.path.exists(priv_path):
             with open(priv_path, "rb") as f:
                 self._load_key(f.read())
@@ -117,16 +112,14 @@ class KalshiHTTPClient:
             return ""
         sig = self.private_key.sign(
             text.encode(),
-            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
+            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
             hashes.SHA256(),
         )
         return base64.b64encode(sig).decode()
 
     def _headers(self, method: str, path: str, body: str = "") -> dict:
-        ts = str(int(datetime.utcnow().timestamp() * 1000))
-        # FIX: Strip query params from path before signing (Kalshi requirement)
-        sign_path = path.split("?")[0]
-        msg = ts + method.upper() + sign_path + body
+        ts = str(int(datetime.utcnow().timestamp()))
+        msg = ts + method.upper() + path + body
         return {
             "KALSHI-ACCESS-KEY": self.key_id,
             "KALSHI-ACCESS-SIGNATURE": self._sign(msg),
@@ -148,19 +141,19 @@ class KalshiHTTPClient:
         return r.json()
 
     def get_balance(self):
-        return self.get("/portfolio/balance")
+        return self.get("/trade-api/v2/portfolio/balance")
 
     def get_events(self, category: str = "", status: str = "open"):
         params = f"?status={status}"
         if category:
             params += f"&category={category}"
-        return self.get("/events" + params)
+        return self.get("/trade-api/v2/events" + params)
 
     def get_markets(self, status: str = "open", limit: int = 100):
-        return self.get(f"/markets?status={status}&limit={limit}")
+        return self.get(f"/trade-api/v2/markets?status={status}&limit={limit}")
 
     def get_market(self, ticker: str):
-        return self.get(f"/markets/{ticker}")
+        return self.get(f"/trade-api/v2/markets/{ticker}")
 
     def create_order(self, ticker: str, side: str, price: int, count: int):
         payload = {
@@ -173,7 +166,7 @@ class KalshiHTTPClient:
             "no_price": price if side == "no" else None,
         }
         payload = {k: v for k, v in payload.items() if v is not None}
-        return self.post("/portfolio/orders", payload)
+        return self.post("/trade-api/v2/portfolio/orders", payload)
 
 
 class KalshiTrader:
@@ -184,6 +177,7 @@ class KalshiTrader:
 
     def scan_markets(self) -> List[Dict]:
         markets = []
+        # Try events endpoint first
         for category in self.config.TARGET_CATEGORIES:
             try:
                 data = self.client.get_events(category=category, status="open")
@@ -192,6 +186,7 @@ class KalshiTrader:
                         markets.append(self._normalize_market(m))
             except Exception as e:
                 logger.error(f"Events scan error [{category}]: {e}")
+        # Fallback: direct markets endpoint
         if not markets:
             try:
                 data = self.client.get_markets(status="open", limit=100)
