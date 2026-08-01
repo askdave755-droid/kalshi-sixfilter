@@ -90,7 +90,6 @@ class KalshiHTTPClient:
     def __init__(self):
         self.key_id = os.getenv("KALSHI_KEY_ID") or os.getenv("KALSHI_API_KEY") or ""
         self.env = os.getenv("KALSHI_ENV", "demo")
-        # FIXED: Correct Kalshi API URLs
         if self.env == "demo":
             self.base = "https://external-api.demo.kalshi.co/trade-api/v2"
         else:
@@ -101,7 +100,9 @@ class KalshiHTTPClient:
         priv_path = os.getenv("KALSHI_PRIVATE_KEY_PATH")
 
         if priv_text:
-            self._load_key(priv_text.encode())
+            # FIX: Handle \n escape sequences from Railway env var
+            key_data = priv_text.replace("\\n", "\n").encode()
+            self._load_key(key_data)
         elif priv_path and os.path.exists(priv_path):
             with open(priv_path, "rb") as f:
                 self._load_key(f.read())
@@ -114,7 +115,6 @@ class KalshiHTTPClient:
     def _sign(self, text: str) -> str:
         if not self.private_key:
             return ""
-        # FIXED: DIGEST_LENGTH per Kalshi docs
         sig = self.private_key.sign(
             text.encode(),
             padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
@@ -123,9 +123,10 @@ class KalshiHTTPClient:
         return base64.b64encode(sig).decode()
 
     def _headers(self, method: str, path: str, body: str = "") -> dict:
-        # FIXED: Milliseconds timestamp per Kalshi docs
         ts = str(int(datetime.utcnow().timestamp() * 1000))
-        msg = ts + method.upper() + path + body
+        # FIX: Strip query params from path before signing (Kalshi requirement)
+        sign_path = path.split("?")[0]
+        msg = ts + method.upper() + sign_path + body
         return {
             "KALSHI-ACCESS-KEY": self.key_id,
             "KALSHI-ACCESS-SIGNATURE": self._sign(msg),
