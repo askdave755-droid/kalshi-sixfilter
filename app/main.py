@@ -1,6 +1,6 @@
 """
-SixFilter Guardian → Kalshi Bridge
-Single-file paste. Drop this into Railway as main.py
+SixFilter Guardian -> Kalshi Bridge
+Single file. Paste as main.py
 """
 
 import os
@@ -17,7 +17,6 @@ from pydantic import BaseModel
 import numpy as np
 from scipy.stats import norm
 
-# ─── OPTIONAL CRYPTO FOR RSA SIGNING ───
 try:
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import padding
@@ -27,9 +26,6 @@ except ImportError:
 
 logger = logging.getLogger("kalshi")
 
-# ═══════════════════════════════════════════════════════
-#  CONFIG
-# ═══════════════════════════════════════════════════════
 
 @dataclass
 class SixFilterConfig:
@@ -46,9 +42,6 @@ class SixFilterConfig:
     MAX_OPEN_POSITIONS: int = 10
     TARGET_CATEGORIES: List[str] = field(default_factory=lambda: ["economics", "finance"])
 
-# ═══════════════════════════════════════════════════════
-#  SIX FILTER ENGINE
-# ═══════════════════════════════════════════════════════
 
 class SixFilterEngine:
     def __init__(self, config: SixFilterConfig):
@@ -92,9 +85,6 @@ class SixFilterEngine:
         passed = ev > self.config.MIN_EV_CENTS
         return passed, ev
 
-# ═══════════════════════════════════════════════════════
-#  KALSHI HTTP CLIENT (lightweight, no pykalshi)
-# ═══════════════════════════════════════════════════════
 
 class KalshiHTTPClient:
     def __init__(self):
@@ -114,7 +104,7 @@ class KalshiHTTPClient:
 
     def _load_key(self, data: bytes):
         if not CRYPTO_OK:
-            raise RuntimeError("cryptography package required for RSA signing")
+            raise RuntimeError("cryptography package required")
         self.private_key = serialization.load_pem_private_key(data, password=None)
 
     def _sign(self, text: str) -> str:
@@ -175,9 +165,6 @@ class KalshiHTTPClient:
         payload = {k: v for k, v in payload.items() if v is not None}
         return self.post("/trade-api/v2/portfolio/orders", payload)
 
-# ═══════════════════════════════════════════════════════
-#  KALSHI TRADER
-# ═══════════════════════════════════════════════════════
 
 class KalshiTrader:
     def __init__(self):
@@ -225,37 +212,29 @@ class KalshiTrader:
     def evaluate_market(self, market: Dict) -> Optional[Dict]:
         if market.get("threshold") is None:
             return None
-
         threshold = market["threshold"]
         yes_price = market["yes_ask"]
         no_price = market["no_ask"]
         spread = market["spread"]
-
         f1_pass, edge, true_prob = self.engine.filter_1_lmsr(threshold, yes_price)
-
         if edge > 0:
             side, trade_price, trade_edge = "yes", yes_price, edge
         elif edge < 0:
             side, trade_price, trade_edge = "no", no_price, abs(edge)
         else:
             return None
-
         f2_pass, kelly, position = self.engine.filter_2_kelly(trade_edge, trade_price, side)
         cost = trade_price if side == "yes" else (100 - trade_price)
         f3_pass, ev = self.engine.filter_3_ev(true_prob, cost, side)
-
         f4_pass = True
         f5_pass = True
         f6_pass = spread < self.config.MAX_SPREAD_CENTS
-
         if not all([f1_pass, f2_pass, f3_pass, f4_pass, f5_pass, f6_pass]):
             return None
-
         contract_cost = trade_price / 100
         count = int(position / contract_cost)
         if count < 1:
             return None
-
         return {
             "ticker": market["ticker"],
             "title": market["title"],
@@ -302,9 +281,6 @@ class KalshiTrader:
                 signals.append(sig)
         return signals
 
-# ═══════════════════════════════════════════════════════
-#  FASTAPI APP
-# ═══════════════════════════════════════════════════════
 
 app = FastAPI(title="SixFilter Kalshi Bridge")
 
@@ -320,18 +296,15 @@ def get_trader() -> KalshiTrader:
             raise HTTPException(status_code=503, detail=f"Kalshi not configured: {e}")
     return _trader
 
+
 @app.get("/")
 async def root():
     return {
         "status": "alive",
         "service": "SixFilter Kalshi Bridge",
         "endpoints": [
-            "/health",
-            "/kalshi/scan",
-            "/kalshi/balance",
-            "/kalshi/markets",
-            "/kalshi/trade",
-            "/kalshi/config",
+            "/health", "/kalshi/scan", "/kalshi/balance",
+            "/kalshi/markets", "/kalshi/trade", "/kalshi/config",
         ],
         "timestamp": datetime.utcnow().isoformat(),
     }
