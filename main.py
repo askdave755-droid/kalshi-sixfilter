@@ -16,7 +16,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Safe Kalshi init — wraps everything in try/except so /health always works
 kalshi = None
 kalshi_config_data = {
     "env": os.getenv("KALSHI_ENV", "demo"),
@@ -35,12 +34,11 @@ except Exception as e:
     kalshi_config_data["error"] = str(e)
     kalshi = None
 
-# V2 Order Model — matches Kalshi V2 API
 class OrderRequest(BaseModel):
     ticker: str
-    side: str          # "bid" or "ask"
-    count: str         # e.g. "1.00"
-    price: str         # e.g. "0.5000"
+    side: str
+    count: str
+    price: str
     client_order_id: str = None
 
 @app.get("/health")
