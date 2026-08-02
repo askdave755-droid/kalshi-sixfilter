@@ -1,5 +1,5 @@
 """
-SixFilter Kalshi Auto-Trader — Complete Single File
+SixFilter Kalshi Auto-Trader - Complete Single File
 Kalshi RSA Auth + Binance Spot Feed + SixFilter + APScheduler + Telegram Bot + Dashboard
 """
 import os
@@ -19,12 +19,9 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-
-# APScheduler for background scanning
 from apscheduler.schedulers.background import BackgroundScheduler
 
 # ========== CONFIG / ENV ==========
-
 MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "10"))
 DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "50.0"))
 MIN_EDGE_PERCENT = float(os.getenv("MIN_EDGE_PERCENT", "5.0"))
@@ -36,7 +33,6 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # ========== TELEGRAM BOT ==========
-
 class TelegramBot:
     def __init__(self):
         self.token = TELEGRAM_BOT_TOKEN
@@ -105,7 +101,6 @@ Last Trade: {status.get("trade_log", [{}])[-1].get("time", "None")}
 telegram = TelegramBot()
 
 # ========== BINANCE SPOT FEED ==========
-
 class BinanceFeed:
     _cache: Dict[str, Tuple[float, float]] = {}
     _cache_ttl = 5
@@ -149,7 +144,6 @@ class BinanceFeed:
             return []
 
 # ========== KALSHI CLIENT ==========
-
 class KalshiClient:
     def __init__(self):
         self.env = os.getenv("KALSHI_ENV", "demo").lower()
@@ -313,7 +307,6 @@ class KalshiClient:
             return {"error": str(e)}
 
 # ========== SIXFILTER ANALYZER ==========
-
 class Direction(Enum):
     YES = "yes"
     NO = "no"
@@ -351,7 +344,7 @@ class SixFilterAnalyzer:
         if strike:
             return float(strike)
         title = market.get("title", "")
-        m = __import__('re').search(r"[\$£€]?([\d,]+\.?\d*)", title)
+        m = __import__('re').search(r"[\$\£\€]?([\d,]+\.?\d*)", title)
         if m:
             return float(m.group(1).replace(",", ""))
         return None
@@ -544,7 +537,6 @@ class SixFilterAnalyzer:
         )
 
 # ========== AUTO-TRADER ENGINE ==========
-
 class AutoTrader:
     def __init__(self, client: KalshiClient, analyzer: SixFilterAnalyzer):
         self.client = client
@@ -666,9 +658,8 @@ class AutoTrader:
                 return
 
         bal = self.client.get_balance()
-# Kalshi returns balance in cents, convert to dollars
-raw_balance = bal.get("balance", 2217)
-self.analyzer.bankroll = raw_balance / 100.0 if raw_balance else 22.17
+        raw_balance = bal.get("balance", 2217)
+        self.analyzer.bankroll = raw_balance / 100.0 if raw_balance else 22.17
 
         all_signals = []
         for series in ["KXBTC15M", "KXETH15M"]:
@@ -698,7 +689,6 @@ self.analyzer.bankroll = raw_balance / 100.0 if raw_balance else 22.17
             }
 
 # ========== FASTAPI APP ==========
-
 app = FastAPI(title="SixFilter Kalshi Auto-Trader")
 
 app.add_middleware(
@@ -720,7 +710,6 @@ analyzer = SixFilterAnalyzer(bankroll=22.17)
 auto_trader = AutoTrader(kalshi, analyzer) if kalshi else None
 
 # ========== PYDANTIC MODELS ==========
-
 class OrderRequest(BaseModel):
     ticker: str
     side: str
@@ -755,7 +744,6 @@ class DashboardExecuteRequest(BaseModel):
     limit_price: float
 
 # ========== ENDPOINTS ==========
-
 @app.get("/health")
 def health():
     cfg = kalshi.get_config() if kalshi else {"error": "not initialized"}
@@ -777,7 +765,12 @@ def kalshi_config():
 def kalshi_balance():
     if not kalshi or not kalshi.is_configured():
         raise HTTPException(status_code=503, detail="Kalshi not configured")
-    return kalshi.get_balance()
+    bal = kalshi.get_balance()
+    # Convert cents to dollars
+    raw = bal.get("balance", 0)
+    if raw:
+        bal["balance_dollars"] = raw / 100.0
+    return bal
 
 @app.get("/kalshi/markets")
 def kalshi_markets(series: str = None, limit: int = 100):
@@ -817,7 +810,6 @@ def kalshi_cancel(order_id: str):
 
 @app.post("/kalshi/analyze")
 def kalshi_analyze(req: DashboardAnalyzeRequest):
-    """Compatible with your existing dashboard HTML"""
     if not auto_trader:
         raise HTTPException(status_code=503, detail="Auto-trader not ready")
 
@@ -870,7 +862,6 @@ def kalshi_analyze(req: DashboardAnalyzeRequest):
 
 @app.post("/kalshi/execute")
 def kalshi_execute(req: DashboardExecuteRequest):
-    """Execute order from dashboard"""
     if not kalshi or not kalshi.is_configured():
         raise HTTPException(status_code=503, detail="Kalshi not configured")
 
@@ -969,15 +960,12 @@ def update_config(cfg: dict):
 
 @app.post("/webhook/telegram")
 async def telegram_webhook(request: Request):
-    """Receive Telegram bot commands"""
     if not telegram.enabled:
         return {"error": "Telegram not configured"}
-
     try:
         data = await request.json()
         msg = data.get("message", {})
         text = msg.get("text", "").strip().lower()
-        chat_id = msg.get("chat", {}).get("id", "")
 
         if text == "/start":
             telegram.send_message("<b>🎯 SixFilter Kalshi Bot</b>\nCommands:\n/status — Account status\n/scan — Run manual scan\n/balance — Kalshi balance\n/trades — Recent trades")
@@ -995,9 +983,9 @@ async def telegram_webhook(request: Request):
         elif text == "/balance":
             if kalshi:
                 bal = kalshi.get_balance()
-                bal_cents = bal.get('balance', 0)
-bal_dollars = bal_cents / 100.0 if bal_cents else 0
-telegram.send_message(f"💰 <b>Balance:</b> ${bal_dollars:.2f}")
+                raw = bal.get('balance', 0)
+                dollars = raw / 100.0 if raw else 0
+                telegram.send_message(f"💰 <b>Balance:</b> ${dollars:.2f}")
             else:
                 telegram.send_message("❌ Kalshi not configured")
         elif text == "/trades":
@@ -1014,14 +1002,12 @@ telegram.send_message(f"💰 <b>Balance:</b> ${bal_dollars:.2f}")
                 telegram.send_message("❌ Auto-trader not ready")
         else:
             telegram.send_message("Unknown command. Try: /status /scan /balance /trades")
-
         return {"ok": True}
     except Exception as e:
         return {"error": str(e)}
 
 @app.get("/telegram/setup")
 def telegram_setup():
-    """Set webhook URL — call once after deploy"""
     if not telegram.enabled:
         return {"error": "Telegram not configured"}
     base = os.getenv("BASE_URL", "")
@@ -1120,7 +1106,8 @@ def dashboard():
             document.getElementById('traderStatus').textContent = health.auto_trader_ready ? '🟢 Ready' : '🔴 Down';
             document.getElementById('traderStatus').style.color = health.auto_trader_ready ? '#00ff88' : '#ff4757';
             document.getElementById('tradeCount').textContent = `${status.trades_today} / ${status.max_trades}`;
-            document.getElementById('balance').textContent = `$${bal.balance?.toFixed?.(2) || bal.balance || 0}`;
+            const balDollars = (bal.balance || 0) / 100;
+            document.getElementById('balance').textContent = `$${balDollars.toFixed(2)}`;
             document.getElementById('tgStatus').textContent = health.telegram ? '🟢 On' : '🔴 Off';
 
             if (status.trade_log && status.trade_log.length > 0) {
@@ -1227,8 +1214,7 @@ def root():
         }
     }
 
-# ========== BACKGROUND SCHEDULER (APScheduler) ==========
-
+# ========== BACKGROUND SCHEDULER ==========
 scheduler = BackgroundScheduler()
 
 def scheduled_scan():
@@ -1244,7 +1230,6 @@ if auto_trader:
     print(f"⏰ APScheduler started: scanning every {SCAN_INTERVAL_SECONDS}s")
 
 # ========== MAIN ==========
-
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8080"))
