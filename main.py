@@ -995,7 +995,9 @@ async def telegram_webhook(request: Request):
         elif text == "/balance":
             if kalshi:
                 bal = kalshi.get_balance()
-                telegram.send_message(f"💰 <b>Balance:</b> ${bal.get('balance', 0):.2f}")
+                bal_cents = bal.get('balance', 0)
+bal_dollars = bal_cents / 100.0 if bal_cents else 0
+telegram.send_message(f"💰 <b>Balance:</b> ${bal_dollars:.2f}")
             else:
                 telegram.send_message("❌ Kalshi not configured")
         elif text == "/trades":
