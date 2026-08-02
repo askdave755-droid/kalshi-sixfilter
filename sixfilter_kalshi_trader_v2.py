@@ -1291,7 +1291,132 @@ def run_scheduler():
 if auto_trader:
     scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
     scheduler_thread.start()
+import time
+from datetime import datetime, timezone
+from typing import List, Dict, Any
 
+# ─── TIME FILTER (Crypto 24/7 aware) ───
+def time_filter_allows(series: str = "") -> bool:
+    """
+    Crypto series (KX*) trade 24/7. 
+    Traditional markets blocked during dead hours.
+    """
+    now = datetime.now(timezone.utc)
+    hour_et = (now.hour - 4) % 24  # rough ET conversion from UTC
+    
+    # Crypto: always allow
+    if series.startswith("KX"):
+        return True
+    
+    # Traditional: only trade 9:35 AM - 3:00 PM ET
+    if hour_et < 9 or hour_et >= 15:
+        return False
+    if hour_et == 9 and now.minute < 35:
+        return False
+    
+    return True
+
+# ─── ACTIVE MARKET SCANNER ───
+def get_active_markets(series_ticker: str = "KXBTC15M", limit: int = 5) -> List[Dict[str, Any]]:
+    """
+    Pulls markets and returns ONLY active ones with real prices.
+    """
+    try:
+        resp = kalshi.get_markets(series=series_ticker)
+        markets = resp.get("markets", [])
+    except Exception as e:
+        print(f"[SCANNER] Error fetching markets: {e}")
+        return []
+    
+    active = []
+    for m in markets:
+        status = m.get("status", "")
+        yes_ask = m.get("yes_ask_dollars", "0")
+        yes_bid = m.get("yes_bid_dollars", "0")
+        
+        # Skip dead markets
+        if status != "active":
+            continue
+        if not yes_ask or float(yes_ask) <= 0:
+            continue
+        if not yes_bid or float(yes_bid) <= 0:
+            continue
+            
+        active.append({
+            "ticker": m.get("ticker"),
+            "event_ticker": m.get("event_ticker"),
+            "yes_ask": float(yes_ask),
+            "yes_bid": float(yes_bid),
+            "no_ask": float(m.get("no_ask_dollars", 0)),
+            "no_bid": float(m.get("no_bid_dollars", 0)),
+            "close_time": m.get("close_time"),
+            "volume": float(m.get("volume_fp", 0)),
+            "open_interest": float(m.get("open_interest_fp", 0)),
+            "strike": m.get("floor_strike"),
+            "status": status
+        })
+    
+    # Sort by closest expiration (soonest first)
+    active.sort(key=lambda x: x.get("close_time", ""))
+    return active[:limit]
+
+# ─── AUTO-TRADE BEST ACTIVE ───
+def trade_best_active(series: str = "KXBTC15M", side: str = "yes", contracts: int = 1):
+    """
+    Finds the best active market and fires immediately.
+    """
+    if not time_filter_allows(series):
+        return {"error": "Time filter blocked", "allowed": False}
+    
+    markets = get_active_markets(series)
+    if not markets:
+        return {"error": "No active markets found", "markets_checked": series}
+    
+    best = markets[0]
+    ticker = best["ticker"]
+    price = best["yes_ask"] if side == "yes" else best["no_ask"]
+    
+    # Safety: don't pay more than 60¢ for binary
+    if price > 60:
+        return {"error": "Price too high", "ticker": ticker, "price": price}
+    
+    result = kalshi.place_order(
+        ticker=ticker,
+        side=side,
+        count=str(contracts),
+        price=str(int(price)),
+        client_order_id=f"auto_{series}_{int(time.time())}"
+    )
+    
+    return {
+        "ticker": ticker,
+        "side": side,
+        "price": price,
+        "contracts": contracts,
+        "order_result": result,
+        "market": best
+    }
+
+# ─── ENDPOINTS ───
+@app.get("/scan-active")
+def scan_active(series: str = "KXBTC15M"):
+    """Returns only active, tradable markets."""
+    return {
+        "series": series,
+        "time_allowed": time_filter_allows(series),
+        "active_markets": get_active_markets(series),
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
+@app.post("/trade-active")
+def trade_active_endpoint(req: dict):
+    """
+    Body: {"series": "KXBTC15M", "side": "yes", "contracts": 1}
+    """
+    series = req.get("series", "KXBTC15M")
+    side = req.get("side", "yes")
+    contracts = req.get("contracts", 1)
+    return trade_best_active(series, side, contracts)
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8080"))
