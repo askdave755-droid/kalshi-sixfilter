@@ -1,8 +1,10 @@
 import os
+import json
 from datetime import datetime
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 app = FastAPI(title="SixFilter Kalshi Trader")
 
@@ -14,7 +16,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Safe Kalshi init — never crashes the app
+# Safe Kalshi init — wraps everything in try/except so /health always works
+kalshi = None
 kalshi_config_data = {
     "env": os.getenv("KALSHI_ENV", "demo"),
     "key_id_set": bool(os.getenv("KALSHI_KEY_ID")),
@@ -29,8 +32,14 @@ try:
     kalshi = KalshiClient()
     kalshi_config_data = kalshi.get_config()
 except Exception as e:
-    kalshi = None
     kalshi_config_data["error"] = str(e)
+    kalshi = None
+
+class OrderRequest(BaseModel):
+    market_id: str
+    side: str
+    count: int
+    price: int = None
 
 @app.get("/health")
 def health():
@@ -51,6 +60,18 @@ def kalshi_balance():
     if kalshi is None or not kalshi.is_configured():
         raise HTTPException(status_code=503, detail="Kalshi not configured")
     return kalshi.get_balance()
+
+@app.get("/kalshi/markets")
+def kalshi_markets(limit: int = 100):
+    if kalshi is None or not kalshi.is_configured():
+        raise HTTPException(status_code=503, detail="Kalshi not configured")
+    return kalshi.get_markets(limit)
+
+@app.post("/kalshi/order")
+def kalshi_order(order: OrderRequest):
+    if kalshi is None or not kalshi.is_configured():
+        raise HTTPException(status_code=503, detail="Kalshi not configured")
+    return kalshi.place_order(order.market_id, order.side, order.count, order.price)
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
