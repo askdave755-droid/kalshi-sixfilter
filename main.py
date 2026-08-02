@@ -210,6 +210,20 @@ class KalshiClient:
             "key_loaded": self.private_key is not None,
             "base_url": self.base_url
         }
+    def get_series(self, limit: int = 200):
+        """Get all available series from Kalshi API"""
+        if not self.is_configured():
+            return {"error": "Kalshi not configured"}
+        path = f"/series?limit={limit}"
+        full_path = f"{self.api_prefix}{path}"
+        url = self._url(path)
+        headers = self._headers("GET", full_path)
+        try:
+            response = self.session.get(url, headers=headers, timeout=10)
+            return response.json() if response.status_code == 200 else {"error": response.text, "status": response.status_code}
+        except Exception as e:
+            return {"error": str(e)}
+
 
     def get_balance(self):
         if not self.is_configured():
@@ -796,18 +810,34 @@ def kalshi_markets(series: str = None, limit: int = 100):
 
 @app.get("/kalshi/series")
 def kalshi_series():
-    """List all available series on Kalshi"""
+    """List all available KX* series on Kalshi (crypto/forex)"""
     if not kalshi or not kalshi.is_configured():
         raise HTTPException(status_code=503, detail="Kalshi not configured")
-    resp = kalshi.get_markets(limit=1000)
+    resp = kalshi.get_series(limit=200)
     if "error" in resp:
         return resp
-    series_set = set()
-    for m in resp.get("markets", []):
-        st = m.get("series_ticker", "")
-        if st:
-            series_set.add(st)
-    return {"count": len(series_set), "series": sorted(list(series_set))}
+    all_series = resp.get("series", [])
+    kx_series = [s for s in all_series if s.get("ticker", "").startswith("KX")]
+    return {
+        "total_series": len(all_series),
+        "kx_series_count": len(kx_series),
+        "kx_series": [
+            {
+                "ticker": s.get("ticker"),
+                "title": s.get("title"),
+                "category": s.get("category"),
+                "status": s.get("status")
+            }
+            for s in kx_series
+        ]
+    }
+
+@app.get("/kalshi/markets/{series_ticker}")
+def kalshi_markets_by_series(series_ticker: str, limit: int = 100):
+    """Check open markets for a specific series"""
+    if not kalshi or not kalshi.is_configured():
+        raise HTTPException(status_code=503, detail="Kalshi not configured")
+    return kalshi.get_markets(series_ticker=series_ticker, limit=limit)
 
 @app.get("/kalshi/orderbook/{ticker}")
 def kalshi_orderbook(ticker: str, depth: int = 10):
