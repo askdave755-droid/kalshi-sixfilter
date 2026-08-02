@@ -3,14 +3,12 @@ import base64
 import json
 import time
 import requests
-from datetime import datetime
-from urllib.parse import urljoin
 
 class KalshiClient:
     def __init__(self):
         self.env = os.getenv("KALSHI_ENV", "demo").lower()
-        # CORRECTED: Live trading API URL
-        self.base_url = "https://trading-api.kalshi.com/trade-api/v2" if self.env == "live" else "https://demo-api.kalshi.com/trade-api/v2"
+        self.base_url = "https://api.elections.kalshi.com" if self.env == "live" else "https://demo-api.kalshi.com"
+        self.api_prefix = "/trade-api/v2"
         self.key_id = os.getenv("KALSHI_KEY_ID", "")
         
         # Load private key
@@ -40,6 +38,7 @@ class KalshiClient:
     def _sign_request(self, method, path, body=""):
         """RSA-SHA256 sign the request for Kalshi auth"""
         timestamp = str(int(time.time() * 1000))
+        # Kalshi signature: timestamp + method + path (path includes /trade-api/v2)
         message = timestamp + method + path + body
         
         try:
@@ -71,23 +70,28 @@ class KalshiClient:
             "Accept": "application/json"
         }
     
+    def _url(self, path):
+        """Build full URL correctly — no urljoin bugs"""
+        return f"{self.base_url}{self.api_prefix}{path}"
+    
     def get_config(self):
         return {
             "env": self.env,
             "key_id_set": bool(self.key_id),
             "key_loaded": self.private_key is not None,
             "key_source": self.key_source,
-            "base_url": self.base_url
+            "base_url": self.base_url,
+            "api_prefix": self.api_prefix
         }
     
     def get_balance(self):
         if not self.is_configured():
             return {"error": "Kalshi not configured", "env": self.env}
         
-        # CORRECTED: /portfolio/balance not /exchange/balance
         path = "/portfolio/balance"
-        url = urljoin(self.base_url, path)
-        headers = self._headers("GET", path)
+        full_path = f"{self.api_prefix}{path}"  # /trade-api/v2/portfolio/balance
+        url = self._url(path)  # https://api.elections.kalshi.com/trade-api/v2/portfolio/balance
+        headers = self._headers("GET", full_path)
         
         try:
             response = self.session.get(url, headers=headers, timeout=10)
@@ -97,19 +101,21 @@ class KalshiClient:
                 return {
                     "error": f"Kalshi API error {response.status_code}",
                     "detail": response.text,
-                    "env": self.env
+                    "env": self.env,
+                    "url": url,
+                    "signed_path": full_path
                 }
         except Exception as e:
             return {"error": str(e), "env": self.env}
     
     def get_markets(self, limit=100):
-        """Get available markets"""
         if not self.is_configured():
             return {"error": "Kalshi not configured"}
         
         path = f"/markets?limit={limit}"
-        url = urljoin(self.base_url, path)
-        headers = self._headers("GET", path)
+        full_path = f"{self.api_prefix}{path}"
+        url = self._url(path)
+        headers = self._headers("GET", full_path)
         
         try:
             response = self.session.get(url, headers=headers, timeout=10)
@@ -118,17 +124,12 @@ class KalshiClient:
             return {"error": str(e)}
     
     def place_order(self, market_id, side, count, price=None):
-        """
-        Place a trade on Kalshi
-        side: "yes" or "no"
-        count: number of contracts
-        price: optional limit price (cents, 0-100)
-        """
         if not self.is_configured():
             return {"error": "Kalshi not configured"}
         
         path = "/portfolio/orders"
-        url = urljoin(self.base_url, path)
+        full_path = f"{self.api_prefix}{path}"
+        url = self._url(path)
         
         body = {
             "market_id": market_id,
@@ -139,7 +140,7 @@ class KalshiClient:
             body["price"] = price
         
         body_json = json.dumps(body)
-        headers = self._headers("POST", path, body_json)
+        headers = self._headers("POST", full_path, body_json)
         
         try:
             response = self.session.post(url, headers=headers, data=body_json, timeout=10)
