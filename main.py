@@ -35,11 +35,13 @@ except Exception as e:
     kalshi_config_data["error"] = str(e)
     kalshi = None
 
+# V2 Order Model — matches Kalshi V2 API
 class OrderRequest(BaseModel):
-    market_id: str
-    side: str
-    count: int
-    price: int = None
+    ticker: str
+    side: str          # "bid" or "ask"
+    count: str         # e.g. "1.00"
+    price: str         # e.g. "0.5000"
+    client_order_id: str = None
 
 @app.get("/health")
 def health():
@@ -71,7 +73,13 @@ def kalshi_markets(limit: int = 100):
 def kalshi_order(order: OrderRequest):
     if kalshi is None or not kalshi.is_configured():
         raise HTTPException(status_code=503, detail="Kalshi not configured")
-    return kalshi.place_order(order.market_id, order.side, order.count, order.price)
+    return kalshi.place_order(
+        ticker=order.ticker,
+        side=order.side,
+        count=order.count,
+        price=order.price,
+        client_order_id=order.client_order_id
+    )
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
