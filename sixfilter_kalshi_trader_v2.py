@@ -1296,3 +1296,20 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8080"))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
+class SimpleTradeRequest(BaseModel):
+    ticker: str
+    side: str
+    contracts: int = 1
+
+@app.post("/trade")
+def simple_trade(req: SimpleTradeRequest):
+    ob = kalshi.get_orderbook(req.ticker)
+    price = ob.get("yes_ask", 50) if req.side == "yes" else ob.get("no_ask", 50)
+    return kalshi.place_order(
+        ticker=req.ticker,
+        side=req.side,
+        count=str(req.contracts),
+        price=str(price),
+        client_order_id=f"auto_{int(time.time())}"
+    )
