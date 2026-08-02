@@ -1,6 +1,7 @@
 """
 SixFilter Kalshi Auto-Trader - Complete Single File
 Kalshi RSA Auth + Binance Spot Feed + SixFilter + APScheduler + Telegram Bot + Dashboard
+Scans: KXBTC15M, KXETH15M, KXBTC1H, KXETH1H, KXBTC1D, KXETH1D
 """
 import os
 import json
@@ -28,6 +29,7 @@ MIN_EDGE_PERCENT = float(os.getenv("MIN_EDGE_PERCENT", "5.0"))
 CONTRACT_SIZE = int(os.getenv("CONTRACT_SIZE", "10"))
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL", "90"))
 AVOID_LUNCH = os.getenv("AVOID_LUNCH", "true").lower() == "true"
+SCAN_SERIES = [s.strip() for s in os.getenv("SCAN_SERIES", "KXBTC15M,KXETH15M,KXBTC1H,KXETH1H").split(",") if s.strip()]
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -337,6 +339,20 @@ class SixFilterAnalyzer:
             return "BTCUSDT"
         if "ETH" in ticker:
             return "ETHUSDT"
+        if "SOL" in ticker:
+            return "SOLUSDT"
+        if "DOGE" in ticker:
+            return "DOGEUSDT"
+        if "XRP" in ticker:
+            return "XRPUSDT"
+        if "ADA" in ticker:
+            return "ADAUSDT"
+        if "AVAX" in ticker:
+            return "AVAXUSDT"
+        if "LINK" in ticker:
+            return "LINKUSDT"
+        if "LTC" in ticker:
+            return "LTCUSDT"
         return ""
 
     def _extract_strike(self, market: dict) -> Optional[float]:
@@ -662,7 +678,7 @@ class AutoTrader:
         self.analyzer.bankroll = raw_balance / 100.0 if raw_balance else 22.17
 
         all_signals = []
-        for series in ["KXBTC15M", "KXETH15M"]:
+        for series in SCAN_SERIES:
             sigs = self.scan_series(series)
             all_signals.extend(sigs)
 
@@ -685,7 +701,8 @@ class AutoTrader:
                 "last_reset": str(self.last_reset),
                 "positions": self.positions,
                 "trade_log": self.trade_log[-20:],
-                "running": self.running
+                "running": self.running,
+                "scanning": SCAN_SERIES
             }
 
 # ========== FASTAPI APP ==========
@@ -766,7 +783,6 @@ def kalshi_balance():
     if not kalshi or not kalshi.is_configured():
         raise HTTPException(status_code=503, detail="Kalshi not configured")
     bal = kalshi.get_balance()
-    # Convert cents to dollars
     raw = bal.get("balance", 0)
     if raw:
         bal["balance_dollars"] = raw / 100.0
@@ -777,6 +793,21 @@ def kalshi_markets(series: str = None, limit: int = 100):
     if not kalshi or not kalshi.is_configured():
         raise HTTPException(status_code=503, detail="Kalshi not configured")
     return kalshi.get_markets(series_ticker=series, limit=limit)
+
+@app.get("/kalshi/series")
+def kalshi_series():
+    """List all available series on Kalshi"""
+    if not kalshi or not kalshi.is_configured():
+        raise HTTPException(status_code=503, detail="Kalshi not configured")
+    resp = kalshi.get_markets(limit=1000)
+    if "error" in resp:
+        return resp
+    series_set = set()
+    for m in resp.get("markets", []):
+        st = m.get("series_ticker", "")
+        if st:
+            series_set.add(st)
+    return {"count": len(series_set), "series": sorted(list(series_set))}
 
 @app.get("/kalshi/orderbook/{ticker}")
 def kalshi_orderbook(ticker: str, depth: int = 10):
@@ -942,11 +973,13 @@ def status():
 
 @app.post("/config")
 def update_config(cfg: dict):
-    global MIN_EDGE_PERCENT, MAX_TRADES_PER_DAY, DAILY_LOSS_LIMIT, CONTRACT_SIZE
+    global MIN_EDGE_PERCENT, MAX_TRADES_PER_DAY, DAILY_LOSS_LIMIT, CONTRACT_SIZE, SCAN_SERIES
     MIN_EDGE_PERCENT = float(cfg.get("min_edge", MIN_EDGE_PERCENT))
     MAX_TRADES_PER_DAY = int(cfg.get("max_trades", MAX_TRADES_PER_DAY))
     DAILY_LOSS_LIMIT = float(cfg.get("daily_loss", DAILY_LOSS_LIMIT))
     CONTRACT_SIZE = int(cfg.get("contract_size", CONTRACT_SIZE))
+    if "scan_series" in cfg:
+        SCAN_SERIES = [s.strip() for s in cfg["scan_series"].split(",") if s.strip()]
     analyzer.min_edge = MIN_EDGE_PERCENT
     return {
         "status": "updated",
@@ -954,7 +987,8 @@ def update_config(cfg: dict):
             "min_edge": MIN_EDGE_PERCENT,
             "max_trades": MAX_TRADES_PER_DAY,
             "daily_loss": DAILY_LOSS_LIMIT,
-            "contract_size": CONTRACT_SIZE
+            "contract_size": CONTRACT_SIZE,
+            "scan_series": SCAN_SERIES
         }
     }
 
@@ -1204,6 +1238,7 @@ def root():
             "analyze": "POST /analyze",
             "kalshi_analyze": "POST /kalshi/analyze",
             "kalshi_execute": "POST /kalshi/execute",
+            "kalshi_series": "GET /kalshi/series",
             "order": "POST /kalshi/order",
             "markets": "GET /kalshi/markets?series=KXBTC15M",
             "balance": "GET /kalshi/balance",
@@ -1227,7 +1262,9 @@ def scheduled_scan():
 if auto_trader:
     scheduler.add_job(scheduled_scan, 'interval', seconds=SCAN_INTERVAL_SECONDS, id='sixfilter_scan', replace_existing=True)
     scheduler.start()
+    auto_trader.running = True
     print(f"⏰ APScheduler started: scanning every {SCAN_INTERVAL_SECONDS}s")
+    print(f"📊 Series: {', '.join(SCAN_SERIES)}")
 
 # ========== MAIN ==========
 if __name__ == "__main__":
