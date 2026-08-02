@@ -1,6 +1,6 @@
 """
 SixFilter Kalshi Auto-Trader — Complete Single File
-Kalshi RSA Auth + Binance Spot Feed + SixFilter + Auto-Scheduler
+Kalshi RSA Auth + Binance Spot Feed + SixFilter + Auto-Scheduler + Telegram Bot + Dashboard
 """
 import os
 import json
@@ -15,8 +15,8 @@ from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from enum import Enum
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -29,12 +29,85 @@ CONTRACT_SIZE = int(os.getenv("CONTRACT_SIZE", "10"))
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL", "90"))
 AVOID_LUNCH = os.getenv("AVOID_LUNCH", "true").lower() == "true"
 
+# Telegram
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# ========== TELEGRAM BOT ==========
+
+class TelegramBot:
+    def __init__(self):
+        self.token = TELEGRAM_BOT_TOKEN
+        self.chat_id = TELEGRAM_CHAT_ID
+        self.base_url = f"https://api.telegram.org/bot{self.token}" if self.token else ""
+        self.enabled = bool(self.token and self.chat_id)
+
+    def send_message(self, text: str, parse_mode: str = "HTML") -> dict:
+        if not self.enabled:
+            return {"error": "Telegram not configured"}
+        try:
+            url = f"{self.base_url}/sendMessage"
+            payload = {
+                "chat_id": self.chat_id,
+                "text": text,
+                "parse_mode": parse_mode,
+                "disable_web_page_preview": True
+            }
+            r = requests.post(url, json=payload, timeout=10)
+            return r.json()
+        except Exception as e:
+            return {"error": str(e)}
+
+    def send_trade_alert(self, signal: dict, order_result: dict = None):
+        emoji = "🟢" if signal.get("direction") == "yes" else "🔴"
+        status = "✅ EXECUTED" if order_result and "order" in order_result else "📊 SIGNAL"
+        text = f"""<b>{emoji} {status}</b>
+
+<b>Market:</b> <code>{signal.get("ticker", "N/A")}</code>
+<b>Side:</b> {signal.get("direction", "N/A").upper()}
+<b>Size:</b> {signal.get("size", "N/A")} contracts
+<b>Price:</b> {signal.get("entry_price", "N/A")}¢
+<b>Edge:</b> {signal.get("edge", 0):.1f}%
+<b>Confidence:</b> {signal.get("confidence", 0)}%
+<b>Spot:</b> {signal.get("binance_spot", "N/A")}
+
+<b>Filters:</b> {signal.get("reason", "N/A")}
+"""
+        if order_result and "error" in order_result:
+            text += f"
+❌ <b>Order Error:</b> {order_result['error']}"
+        return self.send_message(text)
+
+    def send_status(self, status: dict):
+        text = f"""<b>📊 SixFilter Status</b>
+
+Trades Today: <b>{status.get("trades_today", 0)} / {status.get("max_trades", 10)}</b>
+Daily PnL: <b>${status.get("daily_pnl", 0):.2f}</b>
+Loss Limit: <b>${status.get("loss_limit", 50)}</b>
+Min Edge: <b>{status.get("min_edge", 5)}%</b>
+Positions: <b>{len(status.get("positions", {}))}</b> markets
+
+Last Trade: {status.get("trade_log", [{}])[-1].get("time", "None")}
+"""
+        return self.send_message(text)
+
+    def set_webhook(self, webhook_url: str) -> dict:
+        if not self.enabled:
+            return {"error": "Telegram not configured"}
+        try:
+            url = f"{self.base_url}/setWebhook"
+            r = requests.post(url, json={"url": webhook_url}, timeout=10)
+            return r.json()
+        except Exception as e:
+            return {"error": str(e)}
+
+telegram = TelegramBot()
+
 # ========== BINANCE SPOT FEED ==========
 
 class BinanceFeed:
-    """Real-time BTC/ETH spot prices for LMSR edge calc"""
-    _cache: Dict[str, Tuple[float, float]] = {}  # symbol -> (price, timestamp)
-    _cache_ttl = 5  # seconds
+    _cache: Dict[str, Tuple[float, float]] = {}
+    _cache_ttl = 5
 
     @classmethod
     def get_price(cls, symbol: str = "BTCUSDT") -> Optional[float]:
@@ -56,7 +129,6 @@ class BinanceFeed:
 
     @classmethod
     def get_klines(cls, symbol: str = "BTCUSDT", interval: str = "1m", limit: int = 5) -> List[dict]:
-        """Get recent OHLCV for momentum/divergence"""
         try:
             r = requests.get(
                 f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}",
@@ -240,7 +312,7 @@ class KalshiClient:
         except Exception as e:
             return {"error": str(e)}
 
-# ========== SIXFILTER ANALYZER (WITH BINANCE) ==========
+# ========== SIXFILTER ANALYZER ==========
 
 class Direction(Enum):
     YES = "yes"
@@ -252,7 +324,7 @@ class Signal:
     direction: Direction
     edge: float
     confidence: int
-    entry_price: int  # cents 0-100
+    entry_price: int
     size: int
     reason: str
     filters: List[str]
@@ -275,11 +347,9 @@ class SixFilterAnalyzer:
         return ""
 
     def _extract_strike(self, market: dict) -> Optional[float]:
-        """Try to get floor_strike or infer from title"""
         strike = market.get("floor_strike")
         if strike:
             return float(strike)
-        # Fallback: parse from title like "Bitcoin to be above $64,150"
         title = market.get("title", "")
         import re
         m = re.search(r"[\$\£\€]?([\d,]+\.?\d*)", title)
@@ -288,7 +358,6 @@ class SixFilterAnalyzer:
         return None
 
     def _lmsr(self, market: dict, binance_spot: Optional[float]) -> Tuple[float, Direction, str]:
-        """Filter 1: True probability from Binance spot vs Kalshi implied"""
         yes_bid = (market.get("yes_bid") or 0) / 100.0
         yes_ask = (market.get("yes_ask") or 0) / 100.0
         no_bid = (market.get("no_bid") or 0) / 100.0
@@ -299,33 +368,28 @@ class SixFilterAnalyzer:
 
         yes_mid = (yes_bid + yes_ask) / 2
         implied = yes_mid
-
         strike = self._extract_strike(market)
         true_prob = 0.5
 
         if binance_spot and strike:
-            # If spot > strike, probability of YES is higher
-            diff_pct = (binance_spot - strike) / strike
-            # Rough sigmoid mapping: ±1% diff → ±30% prob shift
             import math
+            diff_pct = (binance_spot - strike) / strike
             true_prob = 0.5 + (math.atan(diff_pct * 100) / math.pi) * 0.8
             true_prob = max(0.05, min(0.95, true_prob))
             edge = (true_prob - implied) * 100
             direction = Direction.YES if edge > 0 else Direction.NO
-            return abs(edge), direction, f"LMSR_spot={binance_spot:.0f}_strike={strike:.0f}_true={true_prob:.2f}"
+            return abs(edge), direction, f"LMSR_spot={binance_spot:.0f}_strike={strike:.0f}"
 
-        # Fallback: use momentum from Binance klines
         symbol = self._get_binance_symbol(market.get("ticker", ""))
         klines = BinanceFeed.get_klines(symbol, "1m", 3) if symbol else []
         if len(klines) >= 2:
             momentum = (klines[-1]["close"] - klines[0]["open"]) / klines[0]["open"]
-            true_prob = 0.5 + momentum * 50  # Rough scaling
+            true_prob = 0.5 + momentum * 50
             true_prob = max(0.05, min(0.95, true_prob))
             edge = (true_prob - implied) * 100
             direction = Direction.YES if edge > 0 else Direction.NO
             return abs(edge), direction, f"LMSR_momentum={momentum:.4f}"
 
-        # Last resort: heuristic
         if yes_mid > 0.7:
             true_prob = min(yes_mid + 0.03, 0.95)
         elif yes_mid < 0.3:
@@ -338,7 +402,6 @@ class SixFilterAnalyzer:
         return abs(edge), direction, "LMSR_heuristic"
 
     def _kelly(self, edge: float, bankroll: float, market_price: float) -> Tuple[int, float]:
-        """Filter 2: Position sizing"""
         if edge <= 0:
             return 0, 0.0
         p = 0.5 + edge / 200
@@ -347,19 +410,16 @@ class SixFilterAnalyzer:
         kelly = (b * p - q) / b
         kelly = max(0, min(kelly, self.max_kelly))
         risk = min(bankroll * kelly, self.max_position)
-        # Binary at ~$0.50 entry = ~$0.50 risk per contract
         contracts = int(risk / 0.5)
         return max(1, min(contracts, 100)), kelly
 
     def _ev_gap(self, market: dict, direction: Direction, true_prob: float) -> Tuple[bool, float]:
-        """Filter 3: Expected value check"""
         if direction == Direction.YES:
             entry = (market.get("yes_ask") or 0) / 100.0
             prob = true_prob
         else:
             entry = (market.get("no_ask") or 0) / 100.0
             prob = 1 - true_prob
-
         if entry <= 0:
             return False, 0.0
         ev = (prob * 1.0) - entry
@@ -367,94 +427,72 @@ class SixFilterAnalyzer:
         return ev_pct >= self.min_ev, ev_pct
 
     def _divergence(self, market: dict, klines: List[dict]) -> Tuple[bool, str]:
-        """Filter 4: KL Divergence via volume/price"""
         vol = market.get("volume", 0)
         oi = market.get("open_interest", 0)
         last = (market.get("last_price") or 0) / 100.0
-
         if vol == 0:
             return False, "NO_VOLUME"
-
-        # Kalshi divergence: high vol but price at mid = indecision
         if vol > max(oi, 1) * 0.15 and abs(last - 0.5) < 0.05:
             return False, "VOLUME_MID_INDECISION"
-
-        # Binance divergence: price up but volume down (last 2 candles)
         if len(klines) >= 2:
             price_up = klines[-1]["close"] > klines[-2]["close"]
             vol_down = klines[-1]["volume"] < klines[-2]["volume"] * 0.8
             if price_up and vol_down:
                 return False, "PRICE_UP_VOL_DOWN"
-
         return True, "OK"
 
     def _bayesian(self, trades_today: int, daily_pnl: float, close_time: datetime) -> Tuple[bool, str]:
-        """Filter 5: Context & limits"""
         if daily_pnl <= -DAILY_LOSS_LIMIT:
             return False, "DAILY_LOSS_LIMIT"
         if trades_today >= MAX_TRADES_PER_DAY:
             return False, "MAX_TRADES"
-
-        # Time guards
         now = datetime.now()
         hour = now.hour + now.minute / 60
         if AVOID_LUNCH and 12.0 <= hour <= 13.5:
             return False, "LUNCH_HOUR"
-
         secs = (close_time.replace(tzinfo=None) - now).total_seconds()
         if secs < 30:
             return False, f"CLOSE_{int(secs)}s"
-
         return True, "OK"
 
     def _stoikov(self, market: dict, direction: Direction) -> int:
-        """Filter 6: Limit order at improved price"""
         if direction == Direction.YES:
             bid = market.get("yes_bid") or 0
             ask = market.get("yes_ask") or 0
         else:
             bid = market.get("no_bid") or 0
             ask = market.get("no_ask") or 0
-
         if bid <= 0 or ask <= 0:
             return 0
         mid = (bid + ask) / 2
-        # Improve by 1 cent toward us
         if direction == Direction.YES:
             return max(1, int(mid - 1))
         else:
             return max(1, int(mid - 1))
 
     def analyze(self, market: dict, trades_today: int = 0, daily_pnl: float = 0.0) -> Optional[Signal]:
-        """Run all 6 filters on a Kalshi market dict"""
         passed = []
         ticker = market.get("ticker", "")
-
-        # Time parse
         close_str = market.get("close_time", "")
         try:
             close = datetime.fromisoformat(close_str.replace("Z", "+00:00"))
         except:
             return None
 
-        # 0. Time filter
         ok, reason = self._bayesian(trades_today, daily_pnl, close)
         if not ok:
             return None
         passed.append(f"TIME({reason})")
 
-        # Binance data
         symbol = self._get_binance_symbol(ticker)
         binance_spot = BinanceFeed.get_price(symbol) if symbol else None
         klines = BinanceFeed.get_klines(symbol, "1m", 3) if symbol else []
 
-        # 1. LMSR
         edge, direction, lmsr_reason = self._lmsr(market, binance_spot)
         if edge < self.min_edge:
             return None
         passed.append(lmsr_reason)
 
-        # Track true_prob for EV calc
         if binance_spot:
             strike = self._extract_strike(market)
             if strike:
@@ -467,7 +505,6 @@ class SixFilterAnalyzer:
         else:
             true_prob = 0.5 + (edge / 200) * (1 if direction == Direction.YES else -1)
 
-        # 2. Kelly sizing
         yes_ask = (market.get("yes_ask") or 0) / 100.0
         no_ask = (market.get("no_ask") or 0) / 100.0
         market_price = yes_ask if direction == Direction.YES else no_ask
@@ -475,24 +512,20 @@ class SixFilterAnalyzer:
         if size < 1:
             return None
         size = min(size, CONTRACT_SIZE)
-        passed.append(f"KELLY({size}_f={kelly_frac:.3f})")
+        passed.append(f"KELLY({size})")
 
-        # 3. EV Gap
         ev_ok, ev_pct = self._ev_gap(market, direction, true_prob)
         if not ev_ok:
             return None
         passed.append(f"EV({ev_pct:.1f}%)")
 
-        # 4. Divergence
         div_ok, div_reason = self._divergence(market, klines)
         if not div_ok:
             return None
         passed.append(f"DIV({div_reason})")
 
-        # 5. Bayesian already passed in step 0
         passed.append("BAYESIAN(OK)")
 
-        # 6. Stoikov
         entry = self._stoikov(market, direction)
         if entry <= 0 or entry >= 100:
             return None
@@ -536,9 +569,10 @@ class AutoTrader:
                 self.trade_log = []
                 self.last_reset = today
             print(f"📅 New day reset: {today}")
+            if telegram.enabled:
+                telegram.send_message(f"📅 <b>New Day Started</b>\nCounters reset. Ready to trade.")
 
     def _update_positions(self):
-        """Refresh current positions from Kalshi"""
         resp = self.client.get_positions()
         if "positions" in resp:
             self.positions = {
@@ -548,7 +582,6 @@ class AutoTrader:
             }
 
     def scan_series(self, series: str) -> List[Signal]:
-        """Scan all open markets in a series, return signals"""
         self._reset_day()
         self._update_positions()
 
@@ -563,10 +596,8 @@ class AutoTrader:
         for m in markets:
             if m.get("status") != "open":
                 continue
-
             sig = self.analyzer.analyze(m, self.trades_today, self.daily_pnl)
             if sig:
-                # Check existing position
                 current = self.positions.get(sig.ticker, 0)
                 if abs(current) >= 50:
                     continue
@@ -578,7 +609,6 @@ class AutoTrader:
         return signals
 
     def execute(self, signal: Signal) -> dict:
-        """Place order via KalshiClient"""
         print(f"🎯 EXEC: {signal.ticker} {signal.direction.value} x{signal.size} @ ${signal.entry_price/100:.2f}")
 
         result = self.client.place_order(
@@ -605,13 +635,26 @@ class AutoTrader:
                     "reason": signal.reason,
                     "order_id": oid
                 })
+                # Telegram alert
+                if telegram.enabled:
+                    telegram.send_trade_alert({
+                        "ticker": signal.ticker,
+                        "direction": signal.direction.value,
+                        "size": signal.size,
+                        "entry_price": signal.entry_price,
+                        "edge": signal.edge,
+                        "confidence": signal.confidence,
+                        "binance_spot": signal.binance_spot,
+                        "reason": signal.reason
+                    }, result)
             else:
                 print(f"❌ FAILED: {result.get('error', result)}")
+                if telegram.enabled:
+                    telegram.send_message(f"❌ <b>Order Failed</b>\n{signal.ticker}\nError: {result.get('error', 'Unknown')}")
 
         return result
 
     def run_cycle(self):
-        """One full scan + execute cycle"""
         if not self.client or not self.client.is_configured():
             print("❌ Kalshi not configured, skipping cycle")
             return
@@ -626,7 +669,6 @@ class AutoTrader:
                 print("🛑 Max trades reached")
                 return
 
-        # Update bankroll from live balance
         bal = self.client.get_balance()
         self.analyzer.bankroll = bal.get("balance", 22.17)
 
@@ -635,7 +677,6 @@ class AutoTrader:
             sigs = self.scan_series(series)
             all_signals.extend(sigs)
 
-        # Take top N
         with self._lock:
             remaining = MAX_TRADES_PER_DAY - self.trades_today
 
@@ -654,7 +695,7 @@ class AutoTrader:
                 "min_edge": MIN_EDGE_PERCENT,
                 "last_reset": str(self.last_reset),
                 "positions": self.positions,
-                "trade_log": self.trade_log[-20:],  # Last 20
+                "trade_log": self.trade_log[-20:],
                 "running": self.running
             }
 
@@ -697,6 +738,24 @@ class ManualAnalyzeRequest(BaseModel):
     time_to_event_hours: float = 0.25
     auto_execute: bool = False
 
+class DashboardAnalyzeRequest(BaseModel):
+    market_id: str
+    market_name: str = ""
+    yes_price: float
+    no_price: float
+    volume: float = 50000
+    open_interest: float = 25000
+    your_model_prob: float
+    bankroll: float = 1000
+    daily_pnl: float = 0
+    consecutive_losses: int = 0
+
+class DashboardExecuteRequest(BaseModel):
+    market_id: str
+    side: str
+    contracts: float
+    limit_price: float
+
 # ========== ENDPOINTS ==========
 
 @app.get("/health")
@@ -705,6 +764,7 @@ def health():
     return {
         "status": "ok",
         "kalshi": cfg,
+        "telegram": telegram.enabled,
         "auto_trader_ready": auto_trader is not None,
         "timestamp": datetime.utcnow().isoformat()
     }
@@ -757,13 +817,101 @@ def kalshi_cancel(order_id: str):
         raise HTTPException(status_code=503, detail="Kalshi not configured")
     return kalshi.cancel_order(order_id)
 
-@app.post("/analyze")
-def analyze_market(req: ManualAnalyzeRequest):
-    """Manual analyze + optional execute"""
+# ========== DASHBOARD-COMPATIBLE ENDPOINTS ==========
+
+@app.post("/kalshi/analyze")
+def kalshi_analyze(req: DashboardAnalyzeRequest):
+    """Compatible with your existing dashboard HTML"""
     if not auto_trader:
         raise HTTPException(status_code=503, detail="Auto-trader not ready")
 
-    # Build a fake market dict for the analyzer
+    # Build market dict from dashboard inputs
+    market = {
+        "ticker": req.market_id,
+        "yes_ask": int(req.yes_price),
+        "yes_bid": int(req.yes_price) - 1,
+        "no_ask": int(req.no_price),
+        "no_bid": int(req.no_price) - 1,
+        "last_price": int(req.yes_price),
+        "volume": int(req.volume),
+        "open_interest": int(req.open_interest),
+        "close_time": (datetime.now() + timedelta(hours=2)).isoformat(),
+        "title": req.market_name,
+        "status": "open"
+    }
+
+    # Override bankroll
+    analyzer.bankroll = req.bankroll
+
+    sig = analyzer.analyze(market, auto_trader.trades_today, auto_trader.daily_pnl)
+
+    if not sig:
+        # Return rejection format dashboard expects
+        return {
+            "proceed": False,
+            "side": "no",
+            "contracts": 0,
+            "limit_price": 0,
+            "edge_percent": 0,
+            "confidence": 0,
+            "expected_value": 0,
+            "filters_passed": [False, False, False, False, False, False],
+            "market_id": req.market_id
+        }
+
+    # Calculate expected value
+    prob = 0.5 + sig.edge / 200
+    ev = (prob * 1.0) - (sig.entry_price / 100.0)
+
+    return {
+        "proceed": True,
+        "side": sig.direction.value,
+        "contracts": sig.size,
+        "limit_price": sig.entry_price,
+        "edge_percent": sig.edge,
+        "confidence": sig.confidence,
+        "expected_value": ev,
+        "filters_passed": [True] * len(sig.filters) + [False] * (6 - len(sig.filters)),
+        "market_id": req.market_id,
+        "reason": sig.reason,
+        "binance_spot": sig.binance_spot
+    }
+
+@app.post("/kalshi/execute")
+def kalshi_execute(req: DashboardExecuteRequest):
+    """Execute order from dashboard"""
+    if not kalshi or not kalshi.is_configured():
+        raise HTTPException(status_code=503, detail="Kalshi not configured")
+
+    result = kalshi.place_order(
+        ticker=req.market_id,
+        side=req.side,
+        count=str(int(req.contracts)),
+        price=str(int(req.limit_price))
+    )
+
+    # Telegram alert
+    if telegram.enabled:
+        telegram.send_trade_alert({
+            "ticker": req.market_id,
+            "direction": req.side,
+            "size": int(req.contracts),
+            "entry_price": int(req.limit_price),
+            "edge": 0,
+            "confidence": 100,
+            "binance_spot": None,
+            "reason": "DASHBOARD_MANUAL"
+        }, result)
+
+    return result
+
+# ========== STANDARD ENDPOINTS ==========
+
+@app.post("/analyze")
+def analyze_market(req: ManualAnalyzeRequest):
+    if not auto_trader:
+        raise HTTPException(status_code=503, detail="Auto-trader not ready")
+
     market = {
         "ticker": req.ticker,
         "yes_ask": int(req.market_price * 100),
@@ -802,7 +950,6 @@ def analyze_market(req: ManualAnalyzeRequest):
 
 @app.post("/scan")
 def scan(background_tasks: BackgroundTasks):
-    """Trigger one manual scan cycle"""
     if not auto_trader:
         raise HTTPException(status_code=503, detail="Auto-trader not ready")
     background_tasks.add_task(auto_trader.run_cycle)
@@ -816,7 +963,6 @@ def status():
 
 @app.post("/config")
 def update_config(cfg: dict):
-    """Update risk params (requires restart for full effect)"""
     global MIN_EDGE_PERCENT, MAX_TRADES_PER_DAY, DAILY_LOSS_LIMIT, CONTRACT_SIZE
     MIN_EDGE_PERCENT = float(cfg.get("min_edge", MIN_EDGE_PERCENT))
     MAX_TRADES_PER_DAY = int(cfg.get("max_trades", MAX_TRADES_PER_DAY))
@@ -833,69 +979,243 @@ def update_config(cfg: dict):
         }
     }
 
+# ========== TELEGRAM WEBHOOK ==========
+
+@app.post("/webhook/telegram")
+async def telegram_webhook(request: Request):
+    """Receive Telegram bot commands"""
+    if not telegram.enabled:
+        return {"error": "Telegram not configured"}
+
+    try:
+        data = await request.json()
+        msg = data.get("message", {})
+        text = msg.get("text", "").strip().lower()
+        chat_id = msg.get("chat", {}).get("id", "")
+
+        if text == "/start":
+            telegram.send_message("<b>🎯 SixFilter Kalshi Bot</b>\nCommands:\n/status — Account status\n/scan — Run manual scan\n/balance — Kalshi balance\n/trades — Recent trades")
+        elif text == "/status":
+            if auto_trader:
+                telegram.send_status(auto_trader.get_status())
+            else:
+                telegram.send_message("❌ Auto-trader not ready")
+        elif text == "/scan":
+            if auto_trader:
+                threading.Thread(target=auto_trader.run_cycle).start()
+                telegram.send_message("🔍 <b>Scan triggered</b>")
+            else:
+                telegram.send_message("❌ Auto-trader not ready")
+        elif text == "/balance":
+            if kalshi:
+                bal = kalshi.get_balance()
+                telegram.send_message(f"💰 <b>Balance:</b> ${bal.get('balance', 0):.2f}")
+            else:
+                telegram.send_message("❌ Kalshi not configured")
+        elif text == "/trades":
+            if auto_trader:
+                log = auto_trader.get_status().get("trade_log", [])
+                if log:
+                    msg_text = "<b>📊 Recent Trades</b>\n\n"
+                    for t in log[-5:]:
+                        msg_text += f"{t['ticker'][:20]} | {t['side'].upper()} | {t['size']} @ {t['price']}¢\n"
+                    telegram.send_message(msg_text)
+                else:
+                    telegram.send_message("No trades today")
+            else:
+                telegram.send_message("❌ Auto-trader not ready")
+        else:
+            telegram.send_message("Unknown command. Try: /status /scan /balance /trades")
+
+        return {"ok": True}
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.get("/telegram/setup")
+def telegram_setup():
+    """Set webhook URL — call once after deploy"""
+    if not telegram.enabled:
+        return {"error": "Telegram not configured"}
+    base = os.getenv("BASE_URL", "")
+    if not base:
+        return {"error": "BASE_URL not set in env"}
+    webhook_url = f"{base}/webhook/telegram"
+    result = telegram.set_webhook(webhook_url)
+    return {"webhook_url": webhook_url, "result": result}
+
+@app.post("/telegram/test")
+def telegram_test(msg: str = "Test message from SixFilter"):
+    if not telegram.enabled:
+        return {"error": "Telegram not configured"}
+    return telegram.send_message(f"<b>🧪 Test</b>\n{msg}")
+
+# ========== DASHBOARD ==========
+
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
-    html = """
+    return """
     <!DOCTYPE html>
     <html>
     <head>
-        <title>SixFilter Kalshi Trader</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Kalshi SixFilter</title>
         <style>
-            body { font-family: monospace; background: #0a0a0a; color: #00ff88; padding: 20px; }
-            h1 { color: #f59e0b; }
-            .card { background: #111; border: 1px solid #333; padding: 15px; margin: 10px 0; border-radius: 8px; }
-            button { background: #f59e0b; color: #000; border: none; padding: 10px 20px; cursor: pointer; font-weight: bold; }
-            button:hover { background: #ffb700; }
-            .green { color: #00ff88; }
-            .red { color: #ff4444; }
-            .yellow { color: #f59e0b; }
-            pre { background: #000; padding: 10px; overflow-x: auto; }
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body { font-family: -apple-system, sans-serif; background: #0a0a0a; color: #e0e0e0; padding: 20px; }
+            h1 { color: #00d9ff; margin-bottom: 10px; }
+            .card { background: #151520; padding: 20px; border-radius: 12px; margin-bottom: 15px; border: 1px solid #2d2d44; }
+            input { width: 100%; padding: 12px; background: #0a0a0a; border: 1px solid #2d2d44; border-radius: 8px; color: #fff; margin-bottom: 10px; }
+            button { width: 100%; padding: 14px; background: #00d9ff; color: #000; border: none; border-radius: 8px; font-weight: bold; margin-top: 10px; cursor: pointer; }
+            .btn-success { background: #00ff88; }
+            .btn-danger { background: #ff4757; color: #fff; }
+            .filters { display: flex; gap: 5px; margin: 10px 0; }
+            .badge { width: 30px; height: 30px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: bold; }
+            .pass { background: #00ff88; color: #000; }
+            .fail { background: #ff4757; color: #fff; }
+            .signal { margin-top: 20px; }
+            .hidden { display: none; }
+            .status-bar { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
+            .status-item { background: #1a1a2e; padding: 10px 15px; border-radius: 8px; font-size: 13px; }
+            .status-item span { color: #00ff88; font-weight: bold; }
         </style>
     </head>
     <body>
-        <h1>🎯 SixFilter Kalshi Auto-Trader</h1>
-        <div class="card">
-            <h3>Status</h3>
-            <div id="status">Loading...</div>
+        <h1>🔮 Kalshi SixFilter</h1>
+        <p style="color: #888; margin-bottom: 20px;">MIT 6-Filter Prediction Market Strategy</p>
+
+        <div class="status-bar">
+            <div class="status-item">Trader: <span id="traderStatus">Loading...</span></div>
+            <div class="status-item">Trades: <span id="tradeCount">0</span></div>
+            <div class="status-item">Balance: <span id="balance">$0</span></div>
+            <div class="status-item">Telegram: <span id="tgStatus">?</span></div>
         </div>
+
         <div class="card">
-            <button onclick="scan()">🔍 SCAN NOW</button>
-            <button onclick="loadStatus()">🔄 REFRESH</button>
+            <h3>Auto Controls</h3>
+            <button onclick="triggerScan()">🔍 RUN SCAN NOW</button>
+            <button onclick="loadStatus()" style="margin-top:8px;background:#333;color:#fff;">🔄 REFRESH STATUS</button>
         </div>
+
+        <div class="card">
+            <h3>Market Analysis</h3>
+            <input type="text" id="marketId" placeholder="Market ID (e.g. KXBTC15M-26AUG020130-30)">
+            <input type="text" id="marketName" placeholder="Market Name">
+            <input type="number" id="yesPrice" placeholder="YES Price (¢)" min="1" max="99">
+            <input type="number" id="noPrice" placeholder="NO Price (¢)" min="1" max="99">
+            <input type="number" id="modelProb" placeholder="Your Model Prob (%)" min="0" max="100" step="0.1">
+            <input type="number" id="volume" placeholder="Volume" value="50000">
+            <button onclick="analyze()">🔍 Run SixFilter Analysis</button>
+        </div>
+
+        <div id="result" class="card hidden">
+            <h3 id="resultTitle">Signal</h3>
+            <div id="filters" class="filters"></div>
+            <p id="resultDetails"></p>
+            <button id="executeBtn" class="btn-success hidden" onclick="execute()">Execute on Kalshi</button>
+        </div>
+
         <div class="card">
             <h3>Recent Trades</h3>
-            <div id="trades">None yet</div>
+            <pre id="tradeLog" style="background:#000;padding:10px;overflow-x:auto;font-size:12px;">None yet</pre>
         </div>
-        <script>
-            async function loadStatus() {
-                const r = await fetch('/status');
-                const d = await r.json();
-                document.getElementById('status').innerHTML = `
-                    <span class="${d.running ? 'green' : 'yellow'}">Running: ${d.running}</span><br>
-                    Trades Today: ${d.trades_today} / ${d.max_trades}<br>
-                    Daily PnL: <span class="${d.daily_pnl >= 0 ? 'green' : 'red'}">$${d.daily_pnl.toFixed(2)}</span><br>
-                    Min Edge: ${d.min_edge}%<br>
-                    Loss Limit: $${d.loss_limit}<br>
-                    Positions: ${Object.keys(d.positions).length} markets
-                `;
-                if (d.trade_log && d.trade_log.length > 0) {
-                    document.getElementById('trades').innerHTML = '<pre>' + 
-                        d.trade_log.slice(-5).map(t => JSON.stringify(t, null, 2)).join('\n---\n') + '</pre>';
-                }
+
+    <script>
+    const API_URL = '';
+    let currentSignal = null;
+
+    async function loadStatus() {
+        try {
+            const [health, status, bal] = await Promise.all([
+                fetch('/health').then(r => r.json()),
+                fetch('/status').then(r => r.json()),
+                fetch('/kalshi/balance').then(r => r.json()).catch(() => ({balance:0}))
+            ]);
+            document.getElementById('traderStatus').textContent = health.auto_trader_ready ? '🟢 Ready' : '🔴 Down';
+            document.getElementById('traderStatus').style.color = health.auto_trader_ready ? '#00ff88' : '#ff4757';
+            document.getElementById('tradeCount').textContent = `${status.trades_today} / ${status.max_trades}`;
+            document.getElementById('balance').textContent = `$${bal.balance?.toFixed?.(2) || bal.balance || 0}`;
+            document.getElementById('tgStatus').textContent = health.telegram ? '🟢 On' : '🔴 Off';
+
+            if (status.trade_log && status.trade_log.length > 0) {
+                document.getElementById('tradeLog').textContent =
+                    status.trade_log.slice(-5).map(t => JSON.stringify(t, null, 2)).join('\n---\n');
             }
-            async function scan() {
-                document.getElementById('status').innerHTML = '<span class="yellow">Scanning...</span>';
-                await fetch('/scan', {method: 'POST'});
-                setTimeout(loadStatus, 3000);
-            }
+        } catch(e) {
+            console.error(e);
+        }
+    }
+
+    async function triggerScan() {
+        await fetch('/scan', {method: 'POST'});
+        alert('Scan triggered! Check status in a few seconds.');
+        setTimeout(loadStatus, 5000);
+    }
+
+    async function analyze() {
+        const data = {
+            market_id: document.getElementById('marketId').value,
+            market_name: document.getElementById('marketName').value,
+            yes_price: parseFloat(document.getElementById('yesPrice').value),
+            no_price: parseFloat(document.getElementById('noPrice').value),
+            volume: parseFloat(document.getElementById('volume').value),
+            open_interest: parseFloat(document.getElementById('volume').value) * 0.5,
+            your_model_prob: parseFloat(document.getElementById('modelProb').value) / 100,
+            bankroll: 1000,
+            daily_pnl: 0,
+            consecutive_losses: 0
+        };
+
+        const res = await fetch('/kalshi/analyze', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(data)
+        });
+
+        const signal = await res.json();
+        currentSignal = signal;
+
+        document.getElementById('result').classList.remove('hidden');
+        document.getElementById('resultTitle').textContent = signal.proceed ? '✅ APPROVED' : '❌ REJECTED';
+        document.getElementById('resultTitle').style.color = signal.proceed ? '#00ff88' : '#ff4757';
+
+        const filtersDiv = document.getElementById('filters');
+        filtersDiv.innerHTML = (signal.filters_passed || []).map((p, i) =>
+            `<div class="badge ${p ? 'pass' : 'fail'}">${i+1}</div>`
+        ).join('');
+
+        document.getElementById('resultDetails').innerHTML =
+            `Side: <b>${signal.side?.toUpperCase()}</b> | Contracts: <b>${signal.contracts}</b> | ` +
+            `Price: <b>${signal.limit_price}¢</b> | Edge: <b>${signal.edge_percent?.toFixed?.(1) || 0}%</b><br>` +
+            `Confidence: <b>${signal.confidence}%</b> | EV: <b>$${signal.expected_value?.toFixed?.(2) || 0}</b>`;
+
+        document.getElementById('executeBtn').classList.toggle('hidden', !signal.proceed);
+    }
+
+    async function execute() {
+        if (currentSignal) {
+            const res = await fetch('/kalshi/execute', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    market_id: currentSignal.market_id,
+                    side: currentSignal.side,
+                    contracts: currentSignal.contracts,
+                    limit_price: currentSignal.limit_price
+                })
+            });
+            const result = await res.json();
+            alert(result.order ? 'Order placed!' : 'Order failed: ' + JSON.stringify(result));
             loadStatus();
-            setInterval(loadStatus, 10000);
-        </script>
+        }
+    }
+
+    loadStatus();
+    setInterval(loadStatus, 10000);
+    </script>
     </body>
     </html>
     """
-    return html
 
 @app.get("/")
 def root():
@@ -903,15 +1223,21 @@ def root():
         "message": "SixFilter Kalshi Auto-Trader",
         "docs": "/docs",
         "dashboard": "/dashboard",
+        "telegram": "/telegram/setup",
         "endpoints": {
             "health": "/health",
             "status": "/status",
             "scan": "POST /scan",
             "analyze": "POST /analyze",
+            "kalshi_analyze": "POST /kalshi/analyze",
+            "kalshi_execute": "POST /kalshi/execute",
             "order": "POST /kalshi/order",
             "markets": "GET /kalshi/markets?series=KXBTC15M",
             "balance": "GET /kalshi/balance",
-            "positions": "GET /kalshi/positions"
+            "positions": "GET /kalshi/positions",
+            "telegram_webhook": "POST /webhook/telegram",
+            "telegram_setup": "GET /telegram/setup",
+            "telegram_test": "POST /telegram/test"
         }
     }
 
@@ -927,12 +1253,9 @@ def run_scheduler():
         schedule.run_pending()
         time.sleep(1)
 
-# Start background thread
 if auto_trader:
     scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
     scheduler_thread.start()
-
-# ========== MAIN ==========
 
 if __name__ == "__main__":
     import uvicorn
