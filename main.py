@@ -666,7 +666,9 @@ class AutoTrader:
                 return
 
         bal = self.client.get_balance()
-        self.analyzer.bankroll = bal.get("balance", 22.17)
+# Kalshi returns balance in cents, convert to dollars
+raw_balance = bal.get("balance", 2217)
+self.analyzer.bankroll = raw_balance / 100.0 if raw_balance else 22.17
 
         all_signals = []
         for series in ["KXBTC15M", "KXETH15M"]:
