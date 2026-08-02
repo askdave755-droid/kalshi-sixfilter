@@ -143,7 +143,7 @@ class KalshiClient:
 class KalshiSixFilter:
     def __init__(self, bankroll: float = 22.17):
         self.bankroll = bankroll
-        self.min_edge_percent = 10.0
+        self.min_edge_percent = 5.0
         self.max_kelly_fraction = 0.25
         self.max_position_size = 1.0
         self.min_time_to_event_hours = 2
