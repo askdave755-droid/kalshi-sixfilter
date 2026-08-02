@@ -1,15 +1,16 @@
 import os
 import base64
-import hashlib
-import requests
+import json
 import time
+import requests
 from datetime import datetime
 from urllib.parse import urljoin
 
 class KalshiClient:
     def __init__(self):
         self.env = os.getenv("KALSHI_ENV", "demo").lower()
-        self.base_url = "https://api.elections.kalshi.com/trade-api/v2" if self.env == "live" else "https://demo-api.kalshi.com/trade-api/v2"
+        # CORRECTED: Live trading API URL
+        self.base_url = "https://trading-api.kalshi.com/trade-api/v2" if self.env == "live" else "https://demo-api.kalshi.com/trade-api/v2"
         self.key_id = os.getenv("KALSHI_KEY_ID", "")
         
         # Load private key
@@ -83,7 +84,8 @@ class KalshiClient:
         if not self.is_configured():
             return {"error": "Kalshi not configured", "env": self.env}
         
-        path = "/exchange/balance"
+        # CORRECTED: /portfolio/balance not /exchange/balance
+        path = "/portfolio/balance"
         url = urljoin(self.base_url, path)
         headers = self._headers("GET", path)
         
