@@ -299,14 +299,20 @@ async def analyze_series(series: str, execute: bool = False):
     yes_ask, yes_bid = cents(m, "yes_ask"), cents(m, "yes_bid")
     strike = strike_of(m)
     strike_type = (m.get("strike_type") or "greater").lower()
+    result.update(
+        market_status=(m.get("status") or "").lower(),
+        yes_bid=yes_bid, yes_ask=yes_ask, strike=strike,
+    )
     f["liquidity"] = (
         yes_ask is not None and yes_bid is not None and strike is not None
         and MIN_PRICE_CENTS <= yes_ask <= MAX_PRICE_CENTS
     )
     if not f["liquidity"]:
-        result["reason"] = "prices missing or outside tradable bounds"
+        result["reason"] = (
+            f"prices missing or outside tradable bounds "
+            f"(status={result['market_status']}, bid={yes_bid}, ask={yes_ask}, strike={strike})"
+        )
         return result
-    result.update(yes_bid=yes_bid, yes_ask=yes_ask, strike=strike)
 
     # Filter 3 — live price feed
     try:
@@ -651,3 +657,32 @@ async def debug_markets(series: str = "KXBTC15M"):
             "strike_type": m.get("strike_type"),
         })
     return {"count": len(mkts), "markets": out}
+
+@app.get("/debug/market")
+async def debug_market(ticker: str):
+    """Full raw Kalshi data for ONE market - lifecycle forensics."""
+    data = await kalshi_get(f"/markets/{ticker}")
+    m = data.get("market", data)
+    now = time.time()
+    close = m.get("close_time")
+    mins = None
+    try:
+        mins = round((datetime.fromisoformat(str(close).replace("Z", "+00:00")).timestamp() - now) / 60, 1)
+    except Exception:
+        pass
+    return {
+        "ticker": m.get("ticker"),
+        "status": m.get("status"),
+        "open_time": m.get("open_time"),
+        "close_time": close,
+        "expiration_time": m.get("expiration_time"),
+        "mins_to_close": mins,
+        "yes_bid": m.get("yes_bid"), "yes_ask": m.get("yes_ask"),
+        "no_bid": m.get("no_bid"), "no_ask": m.get("no_ask"),
+        "last_price": m.get("last_price"),
+        "volume": m.get("volume"), "open_interest": m.get("open_interest"),
+        "floor_strike": m.get("floor_strike"), "cap_strike": m.get("cap_strike"),
+        "strike_type": m.get("strike_type"),
+        "can_close_early": m.get("can_close_early"),
+        "raw": m,
+    }
