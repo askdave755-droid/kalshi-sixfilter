@@ -94,6 +94,9 @@ MIN_PRICE_CENTS = env_int("MIN_PRICE_CENTS", default=10)
 MAX_PRICE_CENTS = env_int("MAX_PRICE_CENTS", default=90)
 SCAN_INTERVAL_SEC = env_int("SCAN_INTERVAL_SEC", "SCAN_INTERVAL", default=60)
 ATTEMPT_COOLDOWN_SEC = env_int("ATTEMPT_COOLDOWN_SEC", default=900)  # 15 min
+# Extra cents bid past the quoted price so IOC orders still fill when the
+# botted books flicker between scan and order arrival. 0 = exact price only.
+TAKER_BUFFER_CENTS = env_float("TAKER_BUFFER_CENTS", default=1.0)
 AUTO_TRADE = env("AUTO_TRADE", default="true").lower() == "true"
 
 TELEGRAM_BOT_TOKEN = env("TELEGRAM_BOT_TOKEN")
@@ -394,13 +397,18 @@ async def analyze_series(series: str, execute: bool = False):
         order = await place_order(ticker, side, price_c, TRADE_SIZE)
         result["order"] = order
         if order.get("ok"):
-            STATE["trades_today"] += 1
-            STATE["spent_today_cents"] += (price_c or 0) * TRADE_SIZE
-            STATE["traded_tickers"].append(ticker)
-            status_line = f"\nstatus: {order.get('fill_status')} (filled: {order.get('filled')})" if order.get("fill_status") else ""
+            filled_n = float(order.get("filled") or 0)
+            if filled_n > 0:
+                # Only real fills consume the daily trade/spend caps.
+                STATE["trades_today"] += 1
+                STATE["spent_today_cents"] += (price_c + TAKER_BUFFER_CENTS) * min(filled_n, float(TRADE_SIZE))
+                STATE["traded_tickers"].append(ticker)
+                tag = "FILLED" if filled_n >= TRADE_SIZE else f"PARTIAL {filled_n:g}/{TRADE_SIZE}"
+            else:
+                tag = "NOT FILLED (book moved - no cost, not counted)"
             await tg_send(
-                f"ORDER ACCEPTED\n{ticker}\nbuy {side.upper()} x{TRADE_SIZE} @ {round(price_c, 1)}c\n"
-                f"model {round(p, 3)} - edge {round(edge, 3)} - expires in {round(mins, 1)}m{status_line}"
+                f"ORDER {tag}\n{ticker}\nbuy {side.upper()} x{TRADE_SIZE} @ {round(price_c, 1)}c\n"
+                f"model {round(p, 3)} - edge {round(edge, 3)} - expires in {round(mins, 1)}m"
             )
         else:
             await tg_send(f"ORDER FAILED\n{ticker}\n{order.get('error')}")
@@ -414,12 +422,14 @@ async def place_order(ticker: str, side: str, price_cents: float, count: int):
       - buy NO  at q cents  -> side="ask", price=(100-q)/100  (selling YES = holding NO)
     Prices are fixed-point dollar strings ('0.4800'), count is a fixed-point string.
     """
+    # Cross the spread by TAKER_BUFFER_CENTS so a stale quote still fills;
+    # the books are botted and move between scan and order arrival.
     if side == "yes":
         v2_side = "bid"
-        v2_price = price_cents / 100.0
+        v2_price = min(price_cents + TAKER_BUFFER_CENTS, 99.0) / 100.0
     else:
         v2_side = "ask"
-        v2_price = (100.0 - price_cents) / 100.0
+        v2_price = max(100.0 - price_cents - TAKER_BUFFER_CENTS, 1.0) / 100.0
     body = {
         "ticker": ticker,
         "client_order_id": str(uuid.uuid4()),
@@ -434,9 +444,15 @@ async def place_order(ticker: str, side: str, price_cents: float, count: int):
     try:
         resp = await kalshi_post("/portfolio/events/orders", body)
         order_info = resp.get("order", resp) if isinstance(resp, dict) else {}
-        fill_status = order_info.get("status") or "unknown"
-        filled = order_info.get("fill_count_fp") or order_info.get("fill_count") or ""
-        return {"ok": True, "fill_status": str(fill_status), "filled": str(filled), "request": body, "response": resp}
+        raw_filled = order_info.get("fill_count_fp") or order_info.get("fill_count") or "0"
+        try:
+            filled_f = float(raw_filled)
+        except (TypeError, ValueError):
+            filled_f = 0.0
+        fill_status = order_info.get("status") or order_info.get("fill_status") or (
+            "filled" if filled_f > 0 else "not_filled"
+        )
+        return {"ok": True, "fill_status": str(fill_status), "filled": filled_f, "request": body, "response": resp}
     except httpx.HTTPStatusError as e:
         detail = ""
         try:
@@ -552,10 +568,12 @@ async def manual_trade(req: TradeRequest):
             return {"ok": False, "error": "could not determine market price"}
     order = await place_order(req.ticker, req.side.lower(), price, req.count)
     if order.get("ok"):
-        reset_daily()
-        STATE["trades_today"] += 1
-        STATE["spent_today_cents"] += (price or 0) * req.count
-        STATE["traded_tickers"].append(req.ticker)
+        filled_n = float(order.get("filled") or 0)
+        if filled_n > 0:
+            reset_daily()
+            STATE["trades_today"] += 1
+            STATE["spent_today_cents"] += (price or 0) * min(filled_n, float(req.count))
+            STATE["traded_tickers"].append(req.ticker)
     return order
 
 @app.post("/admin/pause")
