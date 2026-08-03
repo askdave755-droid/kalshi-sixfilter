@@ -620,7 +620,7 @@ def dashboard():
 @app.get("/debug/markets")
 async def debug_markets(series: str = "KXBTC15M"):
     data = await kalshi_get("/markets", params={"series_ticker": series, "limit": 200})
-    mkts = data.get("markets", [])
+    mkts = [m for m in data.get("markets", []) if (m.get("status") or "").lower() in ("open", "initialized")]
     now = time.time()
 
     def close_ts(m):
