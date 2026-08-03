@@ -226,11 +226,25 @@ def strike_of(m: dict):
     return None
 
 async def fetch_active_market(series: str):
-    data = await kalshi_get("/markets", params={"series_ticker": series, "status": "open", "limit": 200})
+    """Pick the tradable market closest to its trading close.
+
+    Kalshi quirks handled here:
+    - `expiration_time` is the SETTLEMENT date (days away), not trading close.
+      `close_time` is when trading actually stops -> use it first.
+    - Markets sit in 'initialized' status (no prices) until the session opens,
+      so we accept both 'open' and 'initialized' and let the liquidity
+      filter reject the ones without prices.
+    Returns (best_pick_or_None, minutes_to_nearest_close_or_None).
+    """
+    data = await kalshi_get("/markets", params={"series_ticker": series, "limit": 200})
     now = time.time()
     best = None
+    nearest_min = None
     for m in data.get("markets", []):
-        exp = m.get("expiration_time") or m.get("close_time")
+        status = (m.get("status") or "").lower()
+        if status not in ("open", "initialized"):
+            continue
+        exp = m.get("close_time") or m.get("expiration_time")
         if not exp:
             continue
         try:
@@ -238,11 +252,13 @@ async def fetch_active_market(series: str):
         except Exception:
             continue
         mins = (exp_ts - now) / 60.0
+        if mins > 0 and (nearest_min is None or mins < nearest_min):
+            nearest_min = mins
         if mins < MIN_MINUTES_TO_EXPIRY or mins > MAX_MINUTES_TO_EXPIRY:
             continue
         if best is None or mins < best["minutes"]:
             best = {"market": m, "minutes": mins}
-    return best
+    return best, nearest_min
 
 # ------------------------------------------------------------------ engine --
 async def analyze_series(series: str, execute: bool = False):
@@ -256,10 +272,11 @@ async def analyze_series(series: str, execute: bool = False):
     f = result["filters"]
 
     # Filter 1 — active market inside the expiry window
-    pick = await fetch_active_market(series)
+    pick, nearest_min = await fetch_active_market(series)
     f["market_active"] = pick is not None
     if not pick:
-        result["reason"] = f"no open market expiring in {MIN_MINUTES_TO_EXPIRY}-{MAX_MINUTES_TO_EXPIRY}m"
+        extra = f" (nearest closes in {round(nearest_min)}m)" if nearest_min else ""
+        result["reason"] = f"no tradable market closing in {MIN_MINUTES_TO_EXPIRY}-{MAX_MINUTES_TO_EXPIRY}m{extra}"
         return result
     m, mins = pick["market"], pick["minutes"]
     ticker = m.get("ticker", "")
@@ -576,6 +593,8 @@ load(); setInterval(load, 10000);
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
     return DASH_HTML
+
+# ------------------------------------------------------------------ debug ---
 @app.get("/debug/markets")
 async def debug_markets(series: str = "KXBTC15M"):
     data = await kalshi_get("/markets", params={"series_ticker": series, "limit": 10})
@@ -583,7 +602,7 @@ async def debug_markets(series: str = "KXBTC15M"):
     now = time.time()
     out = []
     for m in mkts[:5]:
-        exp = m.get("expiration_time") or m.get("close_time")
+        exp = m.get("close_time") or m.get("expiration_time")
         mins = None
         try:
             mins = round((datetime.fromisoformat(str(exp).replace("Z", "+00:00")).timestamp() - now) / 60, 1)
@@ -592,8 +611,9 @@ async def debug_markets(series: str = "KXBTC15M"):
         out.append({
             "ticker": m.get("ticker"),
             "status": m.get("status"),
-            "expiration_time": exp,
-            "mins_to_expiry": mins,
+            "close_time": m.get("close_time"),
+            "expiration_time": m.get("expiration_time"),
+            "mins_to_close": mins,
             "yes_bid": m.get("yes_bid"),
             "yes_ask": m.get("yes_ask"),
             "floor_strike": m.get("floor_strike"),
