@@ -174,7 +174,10 @@ async def binance_stats(symbol: str):
         closes = [float(k[4]) for k in r.json()]
     rets = [math.log(closes[i] / closes[i - 1]) for i in range(1, len(closes)) if closes[i - 1] > 0]
     sigma = statistics.pstdev(rets) if len(rets) > 2 else 0.001
-    drift = (statistics.mean(rets[-20:]) * 0.5) if len(rets) >= 20 else 0.0
+    # Momentum barely persists at 15-min scale and the market prices it near zero.
+    # The 0.5 weight was manufacturing false contrarian edge (3 losses proved it);
+    # keep only a whisper of directional tilt.
+    drift = (statistics.mean(rets[-20:]) * 0.15) if len(rets) >= 20 else 0.0
     return closes[-1], sigma, drift
 
 def prob_above(spot: float, strike: float, sigma_1m: float, drift_1m: float, minutes: float) -> float:
@@ -335,8 +338,13 @@ async def analyze_series(series: str, execute: bool = False):
         return result
     result["spot"] = spot
 
-    # Model probability
-    p = prob_above(spot, strike, sigma, drift, mins)
+    # Model probability.
+    # Settlement uses a 60-second BRTI average, not the point price at close.
+    # Near the end of a window that averaging kills crossing chances, so
+    # evaluate the model at T-0.5min (rough midpoint of the settlement
+    # window) instead of T. This shrinks late-entry "about to cross" edge.
+    t_eff = max(mins - 0.5, 0.25)
+    p = prob_above(spot, strike, sigma, drift, t_eff)
     if strike_type == "less":
         p = 1.0 - p
     result["model_prob"] = round(p, 4)
@@ -389,9 +397,10 @@ async def analyze_series(series: str, execute: bool = False):
             STATE["trades_today"] += 1
             STATE["spent_today_cents"] += (price_c or 0) * TRADE_SIZE
             STATE["traded_tickers"].append(ticker)
+            status_line = f"\nstatus: {order.get('fill_status')} (filled: {order.get('filled')})" if order.get("fill_status") else ""
             await tg_send(
-                f"TRADE PLACED\n{ticker}\nbuy {side.upper()} x{TRADE_SIZE} @ {price_c}c\n"
-                f"model {round(p, 3)} - edge {round(edge, 3)} - expires in {round(mins, 1)}m"
+                f"ORDER ACCEPTED\n{ticker}\nbuy {side.upper()} x{TRADE_SIZE} @ {round(price_c, 1)}c\n"
+                f"model {round(p, 3)} - edge {round(edge, 3)} - expires in {round(mins, 1)}m{status_line}"
             )
         else:
             await tg_send(f"ORDER FAILED\n{ticker}\n{order.get('error')}")
@@ -417,14 +426,17 @@ async def place_order(ticker: str, side: str, price_cents: float, count: int):
         "side": v2_side,
         "count": f"{float(count):.2f}",
         "price": f"{v2_price:.4f}",
-        "time_in_force": "fill_or_kill",
+        "time_in_force": "immediate_or_cancel",   # take what exists, cancel the rest quietly
         "self_trade_prevention_type": "taker_at_cross",
         "post_only": False,
         "reduce_only": False,
     }
     try:
         resp = await kalshi_post("/portfolio/events/orders", body)
-        return {"ok": True, "request": body, "response": resp}
+        order_info = resp.get("order", resp) if isinstance(resp, dict) else {}
+        fill_status = order_info.get("status") or "unknown"
+        filled = order_info.get("fill_count_fp") or order_info.get("fill_count") or ""
+        return {"ok": True, "fill_status": str(fill_status), "filled": str(filled), "request": body, "response": resp}
     except httpx.HTTPStatusError as e:
         detail = ""
         try:
