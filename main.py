@@ -63,14 +63,25 @@ SERIES_SYMBOLS = {
     "KXEURUSD": "EURUSDT",   # Binance EURUSDT ~ EURUSD spot
 }
 
-EDGE_THRESHOLD = float(env("EDGE_THRESHOLD", default="0.08"))   # 8 cents of edge
-TRADE_SIZE = int(env("TRADE_SIZE", default="1"))                 # contracts per trade
+def _edge_value():
+    raw = env("EDGE_THRESHOLD", "MIN_EDGE_PERCENT", default="0.08")
+    try:
+        v = float(raw)
+    except ValueError:
+        return 0.08
+    if v > 1:        # MIN_EDGE_PERCENT may be given as a percent: 8 -> 0.08
+        v = v / 100.0
+    return v
+
+EDGE_THRESHOLD = _edge_value()                                   # minimum model-vs-market edge
+TRADE_SIZE = int(env("TRADE_SIZE", "CONTRACT_SIZE", default="1"))  # contracts per trade
 MAX_TRADES_PER_DAY = int(env("MAX_TRADES_PER_DAY", default="10"))
+DAILY_LOSS_LIMIT = float(env("DAILY_LOSS_LIMIT", default="0"))   # dollars spent/day cap; 0 = off
 MIN_MINUTES_TO_EXPIRY = float(env("MIN_MINUTES_TO_EXPIRY", default="3"))
 MAX_MINUTES_TO_EXPIRY = float(env("MAX_MINUTES_TO_EXPIRY", default="60"))
 MIN_PRICE_CENTS = int(env("MIN_PRICE_CENTS", default="10"))
 MAX_PRICE_CENTS = int(env("MAX_PRICE_CENTS", default="90"))
-SCAN_INTERVAL_SEC = int(env("SCAN_INTERVAL_SEC", default="60"))
+SCAN_INTERVAL_SEC = int(env("SCAN_INTERVAL_SEC", "SCAN_INTERVAL", default="60"))
 ATTEMPT_COOLDOWN_SEC = int(env("ATTEMPT_COOLDOWN_SEC", default="900"))  # 15 min
 AUTO_TRADE = env("AUTO_TRADE", default="true").lower() == "true"
 
@@ -169,6 +180,7 @@ STATE = {
     "paused": not AUTO_TRADE,
     "day": "",
     "trades_today": 0,
+    "spent_today_cents": 0.0,   # total premium committed today (daily cap)
     "traded_tickers": [],       # successful orders, permanent for the day
     "attempt_cooldown": {},     # ticker -> epoch, any attempt (success or fail)
     "last_scan": None,
@@ -182,6 +194,7 @@ def reset_daily():
     if STATE["day"] != today:
         STATE["day"] = today
         STATE["trades_today"] = 0
+        STATE["spent_today_cents"] = 0.0
         STATE["traded_tickers"] = []
         STATE["attempt_cooldown"] = {}
 
@@ -332,15 +345,20 @@ async def analyze_series(series: str, execute: bool = False):
         result["reason"] = f"edge {round(edge, 3)} below threshold {EDGE_THRESHOLD}"
         return result
 
-    # Filter 6 — risk limits
+    # Filter 6 — risk limits (trade count, duplicates, cooldown, daily spend cap)
     cooled = STATE["attempt_cooldown"].get(ticker, 0)
+    cost_cents = (price_c or 0) * TRADE_SIZE
+    spend_cap_cents = DAILY_LOSS_LIMIT * 100.0
+    over_spend_cap = spend_cap_cents > 0 and (STATE["spent_today_cents"] + cost_cents) > spend_cap_cents
     f["risk"] = (
         STATE["trades_today"] < MAX_TRADES_PER_DAY
         and ticker not in STATE["traded_tickers"]
         and (time.time() - cooled) > ATTEMPT_COOLDOWN_SEC
+        and not over_spend_cap
     )
     if not f["risk"]:
-        result["reason"] = "risk limit hit (max trades, duplicate, or cooldown)"
+        why = "daily spend cap" if over_spend_cap else "max trades, duplicate, or cooldown"
+        result["reason"] = f"risk limit hit ({why})"
         return result
 
     result["proceed"] = True
@@ -352,6 +370,7 @@ async def analyze_series(series: str, execute: bool = False):
         result["order"] = order
         if order.get("ok"):
             STATE["trades_today"] += 1
+            STATE["spent_today_cents"] += (price_c or 0) * TRADE_SIZE
             STATE["traded_tickers"].append(ticker)
             await tg_send(
                 f"TRADE PLACED\n{ticker}\nbuy {side.upper()} x{TRADE_SIZE} @ {price_c}c\n"
@@ -456,6 +475,8 @@ def status():
         "auto_trade": AUTO_TRADE,
         "trades_today": STATE["trades_today"],
         "max_trades_per_day": MAX_TRADES_PER_DAY,
+        "spent_today_dollars": round(STATE["spent_today_cents"] / 100.0, 2),
+        "daily_loss_limit": DAILY_LOSS_LIMIT,
         "edge_threshold": EDGE_THRESHOLD,
         "trade_size": TRADE_SIZE,
         "scanning": SCAN_SERIES,
@@ -493,6 +514,7 @@ async def manual_trade(req: TradeRequest):
     if order.get("ok"):
         reset_daily()
         STATE["trades_today"] += 1
+        STATE["spent_today_cents"] += (price or 0) * req.count
         STATE["traded_tickers"].append(req.ticker)
     return order
 
@@ -597,9 +619,18 @@ def dashboard():
 # ------------------------------------------------------------------ debug ---
 @app.get("/debug/markets")
 async def debug_markets(series: str = "KXBTC15M"):
-    data = await kalshi_get("/markets", params={"series_ticker": series, "limit": 10})
+    data = await kalshi_get("/markets", params={"series_ticker": series, "limit": 200})
     mkts = data.get("markets", [])
     now = time.time()
+
+    def close_ts(m):
+        exp = m.get("close_time") or m.get("expiration_time")
+        try:
+            return datetime.fromisoformat(str(exp).replace("Z", "+00:00")).timestamp()
+        except Exception:
+            return float("inf")
+
+    mkts = sorted(mkts, key=close_ts)   # soonest-closing first, like the scanner
     out = []
     for m in mkts[:5]:
         exp = m.get("close_time") or m.get("expiration_time")
