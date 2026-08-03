@@ -97,6 +97,10 @@ ATTEMPT_COOLDOWN_SEC = env_int("ATTEMPT_COOLDOWN_SEC", default=900)  # 15 min
 # Extra cents bid past the quoted price so IOC orders still fill when the
 # botted books flicker between scan and order arrival. 0 = exact price only.
 TAKER_BUFFER_CENTS = env_float("TAKER_BUFFER_CENTS", default=1.0)
+# Take-profit watchdog: once a position's market bid is this many cents above
+# entry, sell it back before settlement and lock the gain. 0 = disabled
+# (hold everything to settlement). Exits never count against daily trade caps.
+TAKE_PROFIT_CENTS = env_float("TAKE_PROFIT_CENTS", default=0.0)
 AUTO_TRADE = env("AUTO_TRADE", default="true").lower() == "true"
 
 TELEGRAM_BOT_TOKEN = env("TELEGRAM_BOT_TOKEN")
@@ -199,6 +203,7 @@ STATE = {
     "trades_today": 0,
     "spent_today_cents": 0.0,   # total premium committed today (daily cap)
     "traded_tickers": [],       # successful orders, permanent for the day
+    "open_positions": [],       # fills awaiting settlement or take-profit exit
     "attempt_cooldown": {},     # ticker -> epoch, any attempt (success or fail)
     "last_scan": None,
     "last_signals": [],
@@ -403,6 +408,10 @@ async def analyze_series(series: str, execute: bool = False):
                 STATE["trades_today"] += 1
                 STATE["spent_today_cents"] += (price_c + TAKER_BUFFER_CENTS) * min(filled_n, float(TRADE_SIZE))
                 STATE["traded_tickers"].append(ticker)
+                STATE["open_positions"].append({
+                    "ticker": ticker, "side": side,
+                    "count": min(filled_n, float(TRADE_SIZE)),
+                    "entry_c": price_c + TAKER_BUFFER_CENTS, "ts": time.time()})
                 tag = "FILLED" if filled_n >= TRADE_SIZE else f"PARTIAL {filled_n:g}/{TRADE_SIZE}"
             else:
                 tag = "NOT FILLED (book moved - no cost, not counted)"
@@ -414,7 +423,7 @@ async def analyze_series(series: str, execute: bool = False):
             await tg_send(f"ORDER FAILED\n{ticker}\n{order.get('error')}")
     return result
 
-async def place_order(ticker: str, side: str, price_cents: float, count: int):
+async def place_order(ticker: str, side: str, price_cents: float, count: int, reduce_only: bool = False):
     """Kalshi Create Order V2: /portfolio/events/orders.
 
     V2 uses a single-book bid/ask model in YES-dollar terms:
@@ -439,7 +448,7 @@ async def place_order(ticker: str, side: str, price_cents: float, count: int):
         "time_in_force": "immediate_or_cancel",   # take what exists, cancel the rest quietly
         "self_trade_prevention_type": "taker_at_cross",
         "post_only": False,
-        "reduce_only": False,
+        "reduce_only": reduce_only,
     }
     try:
         resp = await kalshi_post("/portfolio/events/orders", body)
@@ -462,6 +471,61 @@ async def place_order(ticker: str, side: str, price_cents: float, count: int):
         return {"ok": False, "error": f"HTTP {e.response.status_code}: {detail}", "request": body}
     except Exception as e:
         return {"ok": False, "error": str(e), "request": body}
+
+# ------------------------------------------------------- take-profit exits ---
+async def close_position(pos: dict, reason: str):
+    """Exit a position at the current bid as taker. Selling YES at b cents is
+    identical to buying NO at (100-b) cents, so we reuse place_order."""
+    ticker, side, count = pos["ticker"], pos["side"], pos["count"]
+    try:
+        data = await kalshi_get(f"/markets/{ticker}")
+        m = data.get("market", {})
+        if side == "yes":
+            bid = cents(m, "yes_bid")
+            exit_side, exit_px = "no", (100.0 - bid) if bid is not None else None
+        else:
+            ask = cents(m, "yes_ask")
+            bid = (100.0 - ask) if ask is not None else None
+            exit_side, exit_px = "yes", ask
+        if bid is None or exit_px is None:
+            return False
+        order = await place_order(ticker, exit_side, exit_px, count, reduce_only=True)
+        if order.get("ok") and float(order.get("filled") or 0) > 0:
+            profit = (bid - pos["entry_c"]) * count / 100.0
+            await tg_send(
+                f"TAKE-PROFIT EXIT\n{ticker}\nclosed {side.upper()} x{count:g} @ {round(bid, 1)}c "
+                f"(entry {round(pos['entry_c'], 1)}c)\nlocked: {'+' if profit >= 0 else ''}"
+                f"{round(profit, 2)} USD ({reason})")
+            return True
+    except Exception as e:
+        log.error(f"close_position {ticker}: {e}")
+    return False
+
+async def monitor_positions():
+    """Take-profit watchdog. Runs every scan cycle even while paused:
+    pause stops entries, never exits. Settled markets drop off the registry."""
+    if TAKE_PROFIT_CENTS <= 0 or not STATE["open_positions"]:
+        return
+    still_open = []
+    for pos in STATE["open_positions"]:
+        try:
+            data = await kalshi_get(f"/markets/{pos['ticker']}")
+            m = data.get("market", {})
+            if str(m.get("status", "")).lower() not in ("open", "active", "initialized"):
+                continue  # settled/closed: nothing left to manage
+            if pos["side"] == "yes":
+                bid = cents(m, "yes_bid")
+            else:
+                ask = cents(m, "yes_ask")
+                bid = (100.0 - ask) if ask is not None else None
+            if bid is not None and bid >= pos["entry_c"] + TAKE_PROFIT_CENTS:
+                if await close_position(pos, f"target +{TAKE_PROFIT_CENTS:g}c"):
+                    continue
+            still_open.append(pos)
+        except Exception as e:
+            log.error(f"monitor {pos.get('ticker')}: {e}")
+            still_open.append(pos)
+    STATE["open_positions"] = still_open
 
 async def scan_all(execute: bool = False):
     out = []
@@ -486,6 +550,10 @@ async def auto_loop():
             except Exception as e:
                 STATE["last_error"] = str(e)
                 log.error(f"auto scan error: {e}")
+        try:
+            await monitor_positions()
+        except Exception as e:
+            log.error(f"position monitor error: {e}")
         await asyncio.sleep(SCAN_INTERVAL_SEC)
 
 # -------------------------------------------------------------------- app ---
@@ -495,6 +563,88 @@ app = FastAPI(title="SixFilter Kalshi Trader API", docs_url="/docs")
 async def _startup():
     load_key()
     asyncio.create_task(auto_loop())
+
+# ------------------------------------------- offline model calibration test ---
+async def _fetch_klines(symbol: str, days: int):
+    """Pull `days` of 1m closes from Binance (1000-bar pages, walking back)."""
+    closes = []
+    end = int(time.time() * 1000)
+    need = days * 1440
+    while len(closes) < need:
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.get("https://api.binance.com/api/v3/klines", params={
+                "symbol": symbol, "interval": "1m",
+                "limit": min(1000, need - len(closes)), "endTime": end - 1})
+            r.raise_for_status()
+            ks = r.json()
+        if not ks:
+            break
+        closes = [float(k[4]) for k in ks] + closes
+        end = int(ks[0][0])
+        await asyncio.sleep(0.15)  # be polite with rate limits
+    return closes
+
+@app.get("/backtest")
+async def backtest(symbol: str = "BTCUSDT", days: int = 7):
+    """Replay the EXACT production model over historical 15-min windows.
+    Calibration: when the model says p, does price close above the window
+    open p-fraction of the time? Momentum split tests the mean-reversion
+    hypothesis directly. Read-only: no orders, no state changes."""
+    days = max(1, min(int(days), 14))
+    symbol = symbol.upper()
+    closes = await _fetch_klines(symbol, days)
+    out = {"symbol": symbol, "days": days, "bars": len(closes)}
+    if len(closes) < 500:
+        out["error"] = "not enough kline data"
+        return out
+    rets = [math.log(closes[i] / closes[i - 1]) for i in range(1, len(closes))]
+
+    WINDOW = 15
+    report = {}
+    for m_left in (13, 8, 4):
+        buckets = [[0, 0.0, 0.0] for _ in range(10)]      # [n, p_sum, wins]
+        mom = {"big_up": [0, 0.0, 0.0], "small": [0, 0.0, 0.0], "big_down": [0, 0.0, 0.0]}
+        brier = brier_naive = 0.0
+        n = 0
+        t_eff = max(m_left - 0.5, 0.25)                    # production settlement adjustment
+        for d in range(125, len(closes) - m_left, 3):
+            hist = rets[d - 120:d]                          # same 120 bars the bot reads
+            sigma = statistics.pstdev(hist) if len(hist) > 2 else 0.001
+            drift = statistics.mean(hist[-20:]) * 0.15      # production drift weight
+            spot = closes[d]
+            strike = closes[d - (WINDOW - m_left)]          # price at window open
+            win = 1.0 if closes[d + m_left] >= strike else 0.0
+            p = prob_above(spot, strike, sigma, drift, t_eff)
+            b = min(int(p * 10), 9)
+            buckets[b][0] += 1; buckets[b][1] += p; buckets[b][2] += win
+            brier += (p - win) ** 2; brier_naive += (0.5 - win) ** 2
+            r_prev = math.log(closes[d] / closes[d - WINDOW])
+            big = 1.5 * sigma * math.sqrt(WINDOW)
+            key = "big_up" if r_prev > big else ("big_down" if r_prev < -big else "small")
+            mom[key][0] += 1; mom[key][1] += win; mom[key][2] += p
+            n += 1
+        report[f"minutes_left_{m_left}"] = {
+            "samples": n,
+            "brier_model": round(brier / n, 4) if n else None,
+            "brier_coinflip": round(brier_naive / n, 4) if n else None,
+            "calibration": [
+                {"range": f"{i / 10:.1f}-{(i + 1) / 10:.1f}", "n": bk[0],
+                 "model_avg": round(bk[1] / bk[0], 3), "actual_freq": round(bk[2] / bk[0], 3)}
+                for i, bk in enumerate(buckets) if bk[0]
+            ],
+            "momentum_split": {
+                k: {"n": v[0],
+                    "actual_up_freq": round(v[1] / v[0], 3) if v[0] else None,
+                    "model_avg_p": round(v[2] / v[0], 3) if v[0] else None}
+                for k, v in mom.items()
+            },
+        }
+    out["results"] = report
+    out["how_to_read"] = ("calibration: model_avg should roughly equal actual_freq in every "
+                          "bucket. momentum_split: if big_up actual_up_freq sits well below "
+                          "model_avg_p, the model overprices trend continuation -> mean "
+                          "reversion confirmed and sized.")
+    return out
 
 @app.get("/")
 def root():
@@ -536,6 +686,11 @@ def status():
         "edge_threshold": EDGE_THRESHOLD,
         "trade_size": TRADE_SIZE,
         "scanning": SCAN_SERIES,
+        "take_profit_cents": TAKE_PROFIT_CENTS,
+        "open_positions": [
+            {"ticker": p["ticker"], "side": p["side"], "count": p["count"], "entry_c": p["entry_c"]}
+            for p in STATE["open_positions"]
+        ],
         "last_scan": STATE["last_scan"],
         "last_error": STATE["last_error"],
         "started_at": STATE["started_at"],
@@ -574,6 +729,10 @@ async def manual_trade(req: TradeRequest):
             STATE["trades_today"] += 1
             STATE["spent_today_cents"] += (price or 0) * min(filled_n, float(req.count))
             STATE["traded_tickers"].append(req.ticker)
+            STATE["open_positions"].append({
+                "ticker": req.ticker, "side": req.side.lower(),
+                "count": min(filled_n, float(req.count)),
+                "entry_c": float(price), "ts": time.time()})
     return order
 
 @app.post("/admin/pause")
