@@ -60,24 +60,23 @@ class TelegramBot:
         except Exception as e:
             return {"error": str(e)}
 
-    def send_trade_alert(self, signal: dict, order_result: dict = None):
+        def send_trade_alert(self, signal: dict, order_result: dict = None):
         emoji = "🟢" if signal.get("direction") == "yes" else "🔴"
         status = "✅ EXECUTED" if order_result and "order" in order_result else "📊 SIGNAL"
         text = f"""<b>{emoji} {status}</b>
 
-<b>Market:</b> <code>{signal.get("ticker", "N/A")}</code>
-<b>Side:</b> {signal.get("direction", "N/A").upper()}
-<b>Size:</b> {signal.get("size", "N/A")} contracts
-<b>Price:</b> {signal.get("entry_price", "N/A")}¢
-<b>Edge:</b> {signal.get("edge", 0):.1f}%
-<b>Confidence:</b> {signal.get("confidence", 0)}%
-<b>Spot:</b> {signal.get("binance_spot", "N/A")}
+<b>Market:</b> <code>{signal.get('ticker', 'N/A')}</code>
+<b>Side:</b> {signal.get('direction', 'N/A').upper()}
+<b>Size:</b> {signal.get('size', 'N/A')} contracts
+<b>Price:</b> {signal.get('entry_price', 'N/A')}¢
+<b>Edge:</b> {signal.get('edge', 0):.1f}%
+<b>Confidence:</b> {signal.get('confidence', 0)}%
+<b>Spot:</b> {signal.get('binance_spot', 'N/A')}
 
-<b>Filters:</b> {signal.get("reason", "N/A")}
+<b>Filters:</b> {signal.get('reason', 'N/A')}
 """
         if order_result and "error" in order_result:
-            text += f"
-❌ <b>Order Error:</b> {order_result['error']}"
+            text = text + "\n❌ <b>Order Error:</b> " + str(order_result.get('error', 'Unknown'))
         return self.send_message(text)
 
     def send_status(self, status: dict):
@@ -174,8 +173,7 @@ class KalshiClient:
                 from cryptography.hazmat.primitives import hashes, serialization
                 from cryptography.hazmat.primitives.asymmetric import padding
                 from cryptography.hazmat.backends import default_backend
-                clean_key = key_env.replace("\\n", "
-").strip().encode("utf-8")
+                clean_key = key_env.replace("\\n", chr(10)).strip().encode("utf-8")
                 self.private_key = serialization.load_pem_private_key(
                     clean_key, password=None, backend=default_backend()
                 )
@@ -571,8 +569,7 @@ class AutoTrader:
                 self.last_reset = today
             print(f"📅 New day reset: {today}")
             if telegram.enabled:
-                telegram.send_message(f"📅 <b>New Day Started</b>
-Counters reset. Ready to trade.")
+    telegram.send_message("📅 <b>New Day Started</b>\nCounters reset. Ready to trade.")
 
     def _update_positions(self):
         resp = self.client.get_positions()
@@ -652,9 +649,7 @@ Counters reset. Ready to trade.")
             else:
                 print(f"❌ FAILED: {result.get('error', result)}")
                 if telegram.enabled:
-                    telegram.send_message(f"❌ <b>Order Failed</b>
-{signal.ticker}
-Error: {result.get('error', 'Unknown')}")
+        telegram.send_message("❌ <b>Order Failed</b>\n" + signal.ticker + "\nError: " + str(result.get('error', 'Unknown')))
 
         return result
 
