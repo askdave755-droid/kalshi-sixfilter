@@ -266,7 +266,7 @@ async def fetch_active_market(series: str):
     nearest_min = None
     for m in data.get("markets", []):
         status = (m.get("status") or "").lower()
-        if status not in ("open", "initialized"):
+        if status not in ("open", "initialized", "active"):  # Kalshi uses "active" for live trading
             continue
         exp = m.get("close_time") or m.get("expiration_time")
         if not exp:
@@ -637,7 +637,7 @@ def dashboard():
 @app.get("/debug/markets")
 async def debug_markets(series: str = "KXBTC15M"):
     data = await kalshi_get("/markets", params={"series_ticker": series, "limit": 200})
-    mkts = [m for m in data.get("markets", []) if (m.get("status") or "").lower() in ("open", "initialized")]
+    mkts = [m for m in data.get("markets", []) if (m.get("status") or "").lower() in ("open", "initialized", "active")]
     now = time.time()
 
     def close_ts(m):
