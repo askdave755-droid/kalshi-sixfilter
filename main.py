@@ -1,7 +1,6 @@
 """
-SixFilter Kalshi Auto-Trader - Complete Single File
-Kalshi RSA Auth + Binance Spot Feed + SixFilter + APScheduler + Telegram Bot + Dashboard
-Scans: KXBTC15M, KXETH15M, KXBTC1H, KXETH1H, KXBTC1D, KXETH1D
+SixFilter Kalshi Auto-Trader — Complete Single File
+Kalshi RSA Auth + Binance Spot Feed + SixFilter + Auto-Scheduler + Telegram Bot + Dashboard
 """
 import os
 import json
@@ -9,32 +8,35 @@ import time
 import uuid
 import base64
 import threading
+import schedule
 import requests
+import re
 import math
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from enum import Enum
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from apscheduler.schedulers.background import BackgroundScheduler
 
 # ========== CONFIG / ENV ==========
+
 MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "10"))
 DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "50.0"))
 MIN_EDGE_PERCENT = float(os.getenv("MIN_EDGE_PERCENT", "5.0"))
 CONTRACT_SIZE = int(os.getenv("CONTRACT_SIZE", "10"))
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL", "90"))
 AVOID_LUNCH = os.getenv("AVOID_LUNCH", "true").lower() == "true"
-SCAN_SERIES = [s.strip() for s in os.getenv("SCAN_SERIES", "KXBTC15M,KXETH15M,KXBTC1H,KXETH1H").split(",") if s.strip()]
 
+# Telegram
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # ========== TELEGRAM BOT ==========
+
 class TelegramBot:
     def __init__(self):
         self.token = TELEGRAM_BOT_TOKEN
@@ -74,7 +76,8 @@ class TelegramBot:
 <b>Filters:</b> {signal.get("reason", "N/A")}
 """
         if order_result and "error" in order_result:
-            text += f"\n❌ <b>Order Error:</b> {order_result['error']}"
+            text += f"
+❌ <b>Order Error:</b> {order_result['error']}"
         return self.send_message(text)
 
     def send_status(self, status: dict):
@@ -103,6 +106,7 @@ Last Trade: {status.get("trade_log", [{}])[-1].get("time", "None")}
 telegram = TelegramBot()
 
 # ========== BINANCE SPOT FEED ==========
+
 class BinanceFeed:
     _cache: Dict[str, Tuple[float, float]] = {}
     _cache_ttl = 5
@@ -146,6 +150,7 @@ class BinanceFeed:
             return []
 
 # ========== KALSHI CLIENT ==========
+
 class KalshiClient:
     def __init__(self):
         self.env = os.getenv("KALSHI_ENV", "demo").lower()
@@ -169,7 +174,8 @@ class KalshiClient:
                 from cryptography.hazmat.primitives import hashes, serialization
                 from cryptography.hazmat.primitives.asymmetric import padding
                 from cryptography.hazmat.backends import default_backend
-                clean_key = key_env.replace("\\n", "\n").strip().encode("utf-8")
+                clean_key = key_env.replace("\\n", "
+").strip().encode("utf-8")
                 self.private_key = serialization.load_pem_private_key(
                     clean_key, password=None, backend=default_backend()
                 )
@@ -309,6 +315,7 @@ class KalshiClient:
             return {"error": str(e)}
 
 # ========== SIXFILTER ANALYZER ==========
+
 class Direction(Enum):
     YES = "yes"
     NO = "no"
@@ -339,20 +346,6 @@ class SixFilterAnalyzer:
             return "BTCUSDT"
         if "ETH" in ticker:
             return "ETHUSDT"
-        if "SOL" in ticker:
-            return "SOLUSDT"
-        if "DOGE" in ticker:
-            return "DOGEUSDT"
-        if "XRP" in ticker:
-            return "XRPUSDT"
-        if "ADA" in ticker:
-            return "ADAUSDT"
-        if "AVAX" in ticker:
-            return "AVAXUSDT"
-        if "LINK" in ticker:
-            return "LINKUSDT"
-        if "LTC" in ticker:
-            return "LTCUSDT"
         return ""
 
     def _extract_strike(self, market: dict) -> Optional[float]:
@@ -360,7 +353,7 @@ class SixFilterAnalyzer:
         if strike:
             return float(strike)
         title = market.get("title", "")
-        m = __import__('re').search(r"[\$\£\€]?([\d,]+\.?\d*)", title)
+        m = re.search(r"[$£€]?([\d,]+\.?\d*)", title)
         if m:
             return float(m.group(1).replace(",", ""))
         return None
@@ -448,15 +441,17 @@ class SixFilterAnalyzer:
                 return False, "PRICE_UP_VOL_DOWN"
         return True, "OK"
 
-    def _bayesian(self, trades_today: int, daily_pnl: float, close_time: datetime) -> Tuple[bool, str]:
+    def _bayesian(self, trades_today: int, daily_pnl: float, close_time: datetime, ticker: str = "") -> Tuple[bool, str]:
         if daily_pnl <= -DAILY_LOSS_LIMIT:
             return False, "DAILY_LOSS_LIMIT"
         if trades_today >= MAX_TRADES_PER_DAY:
             return False, "MAX_TRADES"
         now = datetime.now()
         hour = now.hour + now.minute / 60
-        if AVOID_LUNCH and 12.0 <= hour <= 13.5:
-            return False, "LUNCH_HOUR"
+        # Crypto (KX*) trades 24/7 — skip lunch check
+        if not ticker.startswith("KX"):
+            if AVOID_LUNCH and 12.0 <= hour <= 13.5:
+                return False, "LUNCH_HOUR"
         secs = (close_time.replace(tzinfo=None) - now).total_seconds()
         if secs < 30:
             return False, f"CLOSE_{int(secs)}s"
@@ -486,7 +481,7 @@ class SixFilterAnalyzer:
         except:
             return None
 
-        ok, reason = self._bayesian(trades_today, daily_pnl, close)
+        ok, reason = self._bayesian(trades_today, daily_pnl, close, ticker)
         if not ok:
             return None
         passed.append(f"TIME({reason})")
@@ -553,6 +548,7 @@ class SixFilterAnalyzer:
         )
 
 # ========== AUTO-TRADER ENGINE ==========
+
 class AutoTrader:
     def __init__(self, client: KalshiClient, analyzer: SixFilterAnalyzer):
         self.client = client
@@ -575,7 +571,8 @@ class AutoTrader:
                 self.last_reset = today
             print(f"📅 New day reset: {today}")
             if telegram.enabled:
-                telegram.send_message("📅 <b>New Day Started</b>\nCounters reset. Ready to trade.")
+                telegram.send_message(f"📅 <b>New Day Started</b>
+Counters reset. Ready to trade.")
 
     def _update_positions(self):
         resp = self.client.get_positions()
@@ -599,7 +596,8 @@ class AutoTrader:
         signals = []
 
         for m in markets:
-            if m.get("status") != "open":
+            # FIX: Kalshi crypto uses "active", traditional uses "open"
+            if m.get("status") not in ("open", "active"):
                 continue
             sig = self.analyzer.analyze(m, self.trades_today, self.daily_pnl)
             if sig:
@@ -654,7 +652,9 @@ class AutoTrader:
             else:
                 print(f"❌ FAILED: {result.get('error', result)}")
                 if telegram.enabled:
-                    telegram.send_message(f"❌ <b>Order Failed</b>\n{signal.ticker}\nError: {result.get('error', 'Unknown')}")
+                    telegram.send_message(f"❌ <b>Order Failed</b>
+{signal.ticker}
+Error: {result.get('error', 'Unknown')}")
 
         return result
 
@@ -674,11 +674,10 @@ class AutoTrader:
                 return
 
         bal = self.client.get_balance()
-        raw_balance = bal.get("balance", 2217)
-        self.analyzer.bankroll = raw_balance / 100.0 if raw_balance else 22.17
+        self.analyzer.bankroll = bal.get("balance", 22.17)
 
         all_signals = []
-        for series in SCAN_SERIES:
+        for series in ["KXBTC15M", "KXETH15M"]:
             sigs = self.scan_series(series)
             all_signals.extend(sigs)
 
@@ -701,11 +700,11 @@ class AutoTrader:
                 "last_reset": str(self.last_reset),
                 "positions": self.positions,
                 "trade_log": self.trade_log[-20:],
-                "running": self.running,
-                "scanning": SCAN_SERIES
+                "running": self.running
             }
 
 # ========== FASTAPI APP ==========
+
 app = FastAPI(title="SixFilter Kalshi Auto-Trader")
 
 app.add_middleware(
@@ -727,6 +726,7 @@ analyzer = SixFilterAnalyzer(bankroll=22.17)
 auto_trader = AutoTrader(kalshi, analyzer) if kalshi else None
 
 # ========== PYDANTIC MODELS ==========
+
 class OrderRequest(BaseModel):
     ticker: str
     side: str
@@ -754,13 +754,25 @@ class DashboardAnalyzeRequest(BaseModel):
     daily_pnl: float = 0
     consecutive_losses: int = 0
 
+class SimpleTradeRequest(BaseModel):
+    """Simple trade: send {ticker, side, contracts} — auto-fetches price."""
+    ticker: str
+    side: str  # "yes" or "no"
+    contracts: int = 1
+
 class DashboardExecuteRequest(BaseModel):
     market_id: str
     side: str
     contracts: float
     limit_price: float
 
+class TradeActiveRequest(BaseModel):
+    series: str = "KXBTC15M"
+    side: str = "yes"
+    contracts: int = 1
+
 # ========== ENDPOINTS ==========
+
 @app.get("/health")
 def health():
     cfg = kalshi.get_config() if kalshi else {"error": "not initialized"}
@@ -782,32 +794,13 @@ def kalshi_config():
 def kalshi_balance():
     if not kalshi or not kalshi.is_configured():
         raise HTTPException(status_code=503, detail="Kalshi not configured")
-    bal = kalshi.get_balance()
-    raw = bal.get("balance", 0)
-    if raw:
-        bal["balance_dollars"] = raw / 100.0
-    return bal
+    return kalshi.get_balance()
 
 @app.get("/kalshi/markets")
 def kalshi_markets(series: str = None, limit: int = 100):
     if not kalshi or not kalshi.is_configured():
         raise HTTPException(status_code=503, detail="Kalshi not configured")
     return kalshi.get_markets(series_ticker=series, limit=limit)
-
-@app.get("/kalshi/series")
-def kalshi_series():
-    """List all available series on Kalshi"""
-    if not kalshi or not kalshi.is_configured():
-        raise HTTPException(status_code=503, detail="Kalshi not configured")
-    resp = kalshi.get_markets(limit=1000)
-    if "error" in resp:
-        return resp
-    series_set = set()
-    for m in resp.get("markets", []):
-        st = m.get("series_ticker", "")
-        if st:
-            series_set.add(st)
-    return {"count": len(series_set), "series": sorted(list(series_set))}
 
 @app.get("/kalshi/orderbook/{ticker}")
 def kalshi_orderbook(ticker: str, depth: int = 10):
@@ -833,14 +826,154 @@ def kalshi_order(order: OrderRequest):
         client_order_id=order.client_order_id
     )
 
+@app.post("/trade")
+def simple_trade(req: SimpleTradeRequest):
+    """
+    Auto-fetches market price and places order.
+    Send: {"ticker": "KXBTC15M-26AUG020130-30", "side": "yes", "contracts": 1}
+    """
+    if not kalshi or not kalshi.is_configured():
+        raise HTTPException(status_code=503, detail="Kalshi not configured")
+
+    try:
+        ob = kalshi.get_orderbook(req.ticker)
+        yes_ask = ob.get("yes_ask", 50)
+        no_ask = ob.get("no_ask", 50)
+        price = yes_ask if req.side == "yes" else no_ask
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Price fetch failed: {e}")
+
+    return kalshi.place_order(
+        ticker=req.ticker,
+        side=req.side,
+        count=req.contracts,
+        price=price,
+        client_order_id=f"auto_{int(time.time()*1000)}"
+    )
+
 @app.delete("/kalshi/order/{order_id}")
 def kalshi_cancel(order_id: str):
     if not kalshi or not kalshi.is_configured():
         raise HTTPException(status_code=503, detail="Kalshi not configured")
     return kalshi.cancel_order(order_id)
 
+# ========== ACTIVE MARKET SCANNER (NEW) ==========
+
+def time_filter_allows(series: str = "") -> bool:
+    """
+    Crypto series (KX*) trade 24/7.
+    Traditional markets blocked during dead hours.
+    """
+    now = datetime.now(timezone.utc)
+    hour_et = (now.hour - 4) % 24  # rough ET conversion from UTC
+
+    if series.startswith("KX"):
+        return True
+
+    if hour_et < 9 or hour_et >= 15:
+        return False
+    if hour_et == 9 and now.minute < 35:
+        return False
+
+    return True
+
+def get_active_markets(series_ticker: str = "KXBTC15M", limit: int = 5) -> List[dict]:
+    """Pulls markets and returns ONLY active ones with real prices."""
+    try:
+        resp = kalshi.get_markets(series_ticker=series_ticker, limit=100)
+        markets = resp.get("markets", [])
+    except Exception as e:
+        print(f"[SCANNER] Error fetching markets: {e}")
+        return []
+
+    active = []
+    for m in markets:
+        status = m.get("status", "")
+        yes_ask = m.get("yes_ask", 0)
+        yes_bid = m.get("yes_bid", 0)
+
+        if status not in ("active", "open"):
+            continue
+        if not yes_ask or int(yes_ask) <= 0:
+            continue
+        if not yes_bid or int(yes_bid) <= 0:
+            continue
+
+        active.append({
+            "ticker": m.get("ticker"),
+            "event_ticker": m.get("event_ticker"),
+            "yes_ask": int(yes_ask),
+            "yes_bid": int(yes_bid),
+            "no_ask": int(m.get("no_ask", 0)),
+            "no_bid": int(m.get("no_bid", 0)),
+            "close_time": m.get("close_time"),
+            "volume": int(m.get("volume", 0)),
+            "open_interest": int(m.get("open_interest", 0)),
+            "strike": m.get("floor_strike"),
+            "status": status
+        })
+
+    active.sort(key=lambda x: x.get("close_time", ""))
+    return active[:limit]
+
+def trade_best_active(series: str = "KXBTC15M", side: str = "yes", contracts: int = 1):
+    """Finds the best active market and fires immediately."""
+    if not time_filter_allows(series):
+        return {"error": "Time filter blocked", "allowed": False}
+
+    markets = get_active_markets(series)
+    if not markets:
+        return {"error": "No active markets found", "markets_checked": series}
+
+    best = markets[0]
+    ticker = best["ticker"]
+    price = best["yes_ask"] if side == "yes" else best["no_ask"]
+
+    if price > 60:
+        return {"error": "Price too high", "ticker": ticker, "price": price}
+
+    result = kalshi.place_order(
+        ticker=ticker,
+        side=side,
+        count=str(contracts),
+        price=str(int(price)),
+        client_order_id=f"auto_{series}_{int(time.time())}"
+    )
+
+    return {
+        "ticker": ticker,
+        "side": side,
+        "price": price,
+        "contracts": contracts,
+        "order_result": result,
+        "market": best
+    }
+
+@app.get("/scan-active")
+def scan_active(series: str = "KXBTC15M"):
+    """Returns only active, tradable markets."""
+    return {
+        "series": series,
+        "time_allowed": time_filter_allows(series),
+        "active_markets": get_active_markets(series),
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
+@app.post("/trade-active")
+def trade_active_endpoint(req: TradeActiveRequest):
+    """
+    Trade the nearest-expiring ACTIVE market in a series.
+    Body: {"series":"KXBTC15M","side":"yes","contracts":1}
+    """
+    if not kalshi or not kalshi.is_configured():
+        raise HTTPException(status_code=503, detail="Kalshi not configured")
+    return trade_best_active(req.series, req.side, req.contracts)
+
+# ========== DASHBOARD-COMPATIBLE ENDPOINTS ==========
+
 @app.post("/kalshi/analyze")
 def kalshi_analyze(req: DashboardAnalyzeRequest):
+    """Compatible with your existing dashboard HTML"""
     if not auto_trader:
         raise HTTPException(status_code=503, detail="Auto-trader not ready")
 
@@ -859,6 +992,7 @@ def kalshi_analyze(req: DashboardAnalyzeRequest):
     }
 
     analyzer.bankroll = req.bankroll
+
     sig = analyzer.analyze(market, auto_trader.trades_today, auto_trader.daily_pnl)
 
     if not sig:
@@ -893,6 +1027,7 @@ def kalshi_analyze(req: DashboardAnalyzeRequest):
 
 @app.post("/kalshi/execute")
 def kalshi_execute(req: DashboardExecuteRequest):
+    """Execute order from dashboard"""
     if not kalshi or not kalshi.is_configured():
         raise HTTPException(status_code=503, detail="Kalshi not configured")
 
@@ -916,6 +1051,8 @@ def kalshi_execute(req: DashboardExecuteRequest):
         }, result)
 
     return result
+
+# ========== STANDARD ENDPOINTS ==========
 
 @app.post("/analyze")
 def analyze_market(req: ManualAnalyzeRequest):
@@ -973,13 +1110,11 @@ def status():
 
 @app.post("/config")
 def update_config(cfg: dict):
-    global MIN_EDGE_PERCENT, MAX_TRADES_PER_DAY, DAILY_LOSS_LIMIT, CONTRACT_SIZE, SCAN_SERIES
+    global MIN_EDGE_PERCENT, MAX_TRADES_PER_DAY, DAILY_LOSS_LIMIT, CONTRACT_SIZE
     MIN_EDGE_PERCENT = float(cfg.get("min_edge", MIN_EDGE_PERCENT))
     MAX_TRADES_PER_DAY = int(cfg.get("max_trades", MAX_TRADES_PER_DAY))
     DAILY_LOSS_LIMIT = float(cfg.get("daily_loss", DAILY_LOSS_LIMIT))
     CONTRACT_SIZE = int(cfg.get("contract_size", CONTRACT_SIZE))
-    if "scan_series" in cfg:
-        SCAN_SERIES = [s.strip() for s in cfg["scan_series"].split(",") if s.strip()]
     analyzer.min_edge = MIN_EDGE_PERCENT
     return {
         "status": "updated",
@@ -987,22 +1122,31 @@ def update_config(cfg: dict):
             "min_edge": MIN_EDGE_PERCENT,
             "max_trades": MAX_TRADES_PER_DAY,
             "daily_loss": DAILY_LOSS_LIMIT,
-            "contract_size": CONTRACT_SIZE,
-            "scan_series": SCAN_SERIES
+            "contract_size": CONTRACT_SIZE
         }
     }
 
+# ========== TELEGRAM WEBHOOK ==========
+
 @app.post("/webhook/telegram")
 async def telegram_webhook(request: Request):
+    """Receive Telegram bot commands"""
     if not telegram.enabled:
         return {"error": "Telegram not configured"}
+
     try:
         data = await request.json()
         msg = data.get("message", {})
         text = msg.get("text", "").strip().lower()
+        chat_id = msg.get("chat", {}).get("id", "")
 
         if text == "/start":
-            telegram.send_message("<b>🎯 SixFilter Kalshi Bot</b>\nCommands:\n/status — Account status\n/scan — Run manual scan\n/balance — Kalshi balance\n/trades — Recent trades")
+            telegram.send_message("<b>🎯 SixFilter Kalshi Bot</b>
+Commands:
+/status — Account status
+/scan — Run manual scan
+/balance — Kalshi balance
+/trades — Recent trades")
         elif text == "/status":
             if auto_trader:
                 telegram.send_status(auto_trader.get_status())
@@ -1017,18 +1161,19 @@ async def telegram_webhook(request: Request):
         elif text == "/balance":
             if kalshi:
                 bal = kalshi.get_balance()
-                raw = bal.get('balance', 0)
-                dollars = raw / 100.0 if raw else 0
-                telegram.send_message(f"💰 <b>Balance:</b> ${dollars:.2f}")
+                telegram.send_message(f"💰 <b>Balance:</b> ${bal.get('balance', 0):.2f}")
             else:
                 telegram.send_message("❌ Kalshi not configured")
         elif text == "/trades":
             if auto_trader:
                 log = auto_trader.get_status().get("trade_log", [])
                 if log:
-                    msg_text = "<b>📊 Recent Trades</b>\n\n"
+                    msg_text = "<b>📊 Recent Trades</b>
+
+"
                     for t in log[-5:]:
-                        msg_text += f"{t['ticker'][:20]} | {t['side'].upper()} | {t['size']} @ {t['price']}¢\n"
+                        msg_text += f"{t['ticker'][:20]} | {t['side'].upper()} | {t['size']} @ {t['price']}¢
+"
                     telegram.send_message(msg_text)
                 else:
                     telegram.send_message("No trades today")
@@ -1036,12 +1181,14 @@ async def telegram_webhook(request: Request):
                 telegram.send_message("❌ Auto-trader not ready")
         else:
             telegram.send_message("Unknown command. Try: /status /scan /balance /trades")
+
         return {"ok": True}
     except Exception as e:
         return {"error": str(e)}
 
 @app.get("/telegram/setup")
 def telegram_setup():
+    """Set webhook URL — call once after deploy"""
     if not telegram.enabled:
         return {"error": "Telegram not configured"}
     base = os.getenv("BASE_URL", "")
@@ -1055,7 +1202,10 @@ def telegram_setup():
 def telegram_test(msg: str = "Test message from SixFilter"):
     if not telegram.enabled:
         return {"error": "Telegram not configured"}
-    return telegram.send_message(f"<b>🧪 Test</b>\n{msg}")
+    return telegram.send_message(f"<b>🧪 Test</b>
+{msg}")
+
+# ========== DASHBOARD ==========
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
@@ -1140,13 +1290,14 @@ def dashboard():
             document.getElementById('traderStatus').textContent = health.auto_trader_ready ? '🟢 Ready' : '🔴 Down';
             document.getElementById('traderStatus').style.color = health.auto_trader_ready ? '#00ff88' : '#ff4757';
             document.getElementById('tradeCount').textContent = `${status.trades_today} / ${status.max_trades}`;
-            const balDollars = (bal.balance || 0) / 100;
-            document.getElementById('balance').textContent = `$${balDollars.toFixed(2)}`;
+            document.getElementById('balance').textContent = `$${bal.balance?.toFixed?.(2) || bal.balance || 0}`;
             document.getElementById('tgStatus').textContent = health.telegram ? '🟢 On' : '🔴 Off';
 
             if (status.trade_log && status.trade_log.length > 0) {
                 document.getElementById('tradeLog').textContent =
-                    status.trade_log.slice(-5).map(t => JSON.stringify(t, null, 2)).join('\\n---\\n');
+                    status.trade_log.slice(-5).map(t => JSON.stringify(t, null, 2)).join('
+---
+');
             }
         } catch(e) {
             console.error(e);
@@ -1238,8 +1389,10 @@ def root():
             "analyze": "POST /analyze",
             "kalshi_analyze": "POST /kalshi/analyze",
             "kalshi_execute": "POST /kalshi/execute",
-            "kalshi_series": "GET /kalshi/series",
+            "scan_active": "GET /scan-active?series=KXBTC15M",
+            "trade_active": "POST /trade-active",
             "order": "POST /kalshi/order",
+            "trade": "POST /trade",
             "markets": "GET /kalshi/markets?series=KXBTC15M",
             "balance": "GET /kalshi/balance",
             "positions": "GET /kalshi/positions",
@@ -1250,23 +1403,21 @@ def root():
     }
 
 # ========== BACKGROUND SCHEDULER ==========
-scheduler = BackgroundScheduler()
 
-def scheduled_scan():
-    if auto_trader:
-        try:
-            auto_trader.run_cycle()
-        except Exception as e:
-            print(f"[Scheduler] Error: {e}")
+def run_scheduler():
+    if not auto_trader:
+        print("❌ Auto-trader not initialized, scheduler exiting")
+        return
+    print(f"⏰ Scheduler started: every {SCAN_INTERVAL_SECONDS}s")
+    schedule.every(SCAN_INTERVAL_SECONDS).seconds.do(auto_trader.run_cycle)
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
 
 if auto_trader:
-    scheduler.add_job(scheduled_scan, 'interval', seconds=SCAN_INTERVAL_SECONDS, id='sixfilter_scan', replace_existing=True)
-    scheduler.start()
-    auto_trader.running = True
-    print(f"⏰ APScheduler started: scanning every {SCAN_INTERVAL_SECONDS}s")
-    print(f"📊 Series: {', '.join(SCAN_SERIES)}")
+    scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
+    scheduler_thread.start()
 
-# ========== MAIN ==========
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8080"))
