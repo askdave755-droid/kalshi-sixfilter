@@ -170,8 +170,26 @@ async def kalshi_post(endpoint: str, body: dict):
         return r.json()
 
 # ---------------------------------------------------------------- binance ---
+# Recalibration constants, sized from the 7-day backtest (~3,300 windows per
+# horizon per asset): >10min out the model's extremes ran 10-14pts hot, and
+# ETH mean-reverts ~10pts after big 15m moves while BTC barely does (~2.5pts).
+EARLY_SHRINK_MINUTES = 10.0
+EARLY_SHRINK_FACTOR = 0.88
+REVERSION = {"ETHUSDT": 0.10, "BTCUSDT": 0.025}
+
+def recalibrate(p: float, mins_left: float, r15: float, sigma_1m: float, symbol: str) -> float:
+    """Data-driven corrections to the raw model probability."""
+    if mins_left > EARLY_SHRINK_MINUTES:
+        p = 0.5 + (p - 0.5) * EARLY_SHRINK_FACTOR
+    big = 1.5 * sigma_1m * math.sqrt(15)
+    if abs(r15) > big and mins_left > 4:
+        rev = REVERSION.get(symbol, 0.05) * min((mins_left - 4) / 9.0, 1.0)
+        p += rev if r15 < 0 else -rev   # big down-move -> up-reversion, and vice versa
+    return min(max(p, 0.01), 0.99)
+
 async def binance_stats(symbol: str):
-    """Return (spot, sigma_per_minute, dampened_drift_per_minute)."""
+    """Return (spot, sigma_per_minute, dampened_drift_per_minute, r15).
+    r15 = log return over the trailing 15 minutes, used by recalibrate()."""
     async with httpx.AsyncClient(timeout=10) as c:
         r = await c.get(
             "https://api.binance.com/api/v3/klines",
@@ -185,7 +203,8 @@ async def binance_stats(symbol: str):
     # The 0.5 weight was manufacturing false contrarian edge (3 losses proved it);
     # keep only a whisper of directional tilt.
     drift = (statistics.mean(rets[-20:]) * 0.15) if len(rets) >= 20 else 0.0
-    return closes[-1], sigma, drift
+    r15 = math.log(closes[-1] / closes[-15]) if len(closes) >= 16 else 0.0
+    return closes[-1], sigma, drift, r15
 
 def prob_above(spot: float, strike: float, sigma_1m: float, drift_1m: float, minutes: float) -> float:
     if minutes <= 0:
@@ -338,7 +357,7 @@ async def analyze_series(series: str, execute: bool = False):
 
     # Filter 3 — live price feed
     try:
-        spot, sigma, drift = await binance_stats(symbol)
+        spot, sigma, drift, r15 = await binance_stats(symbol)
         f["data_fresh"] = True
     except Exception as e:
         f["data_fresh"] = False
@@ -353,6 +372,9 @@ async def analyze_series(series: str, execute: bool = False):
     # window) instead of T. This shrinks late-entry "about to cross" edge.
     t_eff = max(mins - 0.5, 0.25)
     p = prob_above(spot, strike, sigma, drift, t_eff)
+    # Backtest-sized corrections: early-window overconfidence shrink +
+    # mean-reversion after big 15m moves (ETH strong, BTC mild).
+    p = recalibrate(p, mins, r15, sigma, symbol)
     if strike_type == "less":
         p = 1.0 - p
     result["model_prob"] = round(p, 4)
@@ -585,11 +607,12 @@ async def _fetch_klines(symbol: str, days: int):
     return closes
 
 @app.get("/backtest")
-async def backtest(symbol: str = "BTCUSDT", days: int = 7):
+async def backtest(symbol: str = "BTCUSDT", days: int = 7, adj: int = 0):
     """Replay the EXACT production model over historical 15-min windows.
     Calibration: when the model says p, does price close above the window
     open p-fraction of the time? Momentum split tests the mean-reversion
-    hypothesis directly. Read-only: no orders, no state changes."""
+    hypothesis directly. adj=1 applies the production recalibrate() pass so
+    we can verify the fixes close the measured defects. Read-only."""
     days = max(1, min(int(days), 14))
     symbol = symbol.upper()
     closes = await _fetch_klines(symbol, days)
@@ -615,6 +638,9 @@ async def backtest(symbol: str = "BTCUSDT", days: int = 7):
             strike = closes[d - (WINDOW - m_left)]          # price at window open
             win = 1.0 if closes[d + m_left] >= strike else 0.0
             p = prob_above(spot, strike, sigma, drift, t_eff)
+            if adj:
+                r15_bt = math.log(closes[d] / closes[d - WINDOW])
+                p = recalibrate(p, m_left, r15_bt, sigma, symbol)
             b = min(int(p * 10), 9)
             buckets[b][0] += 1; buckets[b][1] += p; buckets[b][2] += win
             brier += (p - win) ** 2; brier_naive += (0.5 - win) ** 2
