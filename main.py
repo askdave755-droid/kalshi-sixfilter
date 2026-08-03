@@ -398,21 +398,32 @@ async def analyze_series(series: str, execute: bool = False):
     return result
 
 async def place_order(ticker: str, side: str, price_cents: float, count: int):
+    """Kalshi Create Order V2: /portfolio/events/orders.
+
+    V2 uses a single-book bid/ask model in YES-dollar terms:
+      - buy YES at p cents  -> side="bid", price=p/100
+      - buy NO  at q cents  -> side="ask", price=(100-q)/100  (selling YES = holding NO)
+    Prices are fixed-point dollar strings ('0.4800'), count is a fixed-point string.
+    """
+    if side == "yes":
+        v2_side = "bid"
+        v2_price = price_cents / 100.0
+    else:
+        v2_side = "ask"
+        v2_price = (100.0 - price_cents) / 100.0
     body = {
         "ticker": ticker,
         "client_order_id": str(uuid.uuid4()),
-        "action": "buy",
-        "side": side,
-        "type": "limit",
-        "count": int(count),
+        "side": v2_side,
+        "count": f"{float(count):.2f}",
+        "price": f"{v2_price:.4f}",
         "time_in_force": "fill_or_kill",
+        "self_trade_prevention_type": "taker_at_cross",
+        "post_only": False,
+        "reduce_only": False,
     }
-    if side == "yes":
-        body["yes_price"] = int(round(price_cents))
-    else:
-        body["no_price"] = int(round(price_cents))
     try:
-        resp = await kalshi_post("/portfolio/orders", body)
+        resp = await kalshi_post("/portfolio/events/orders", body)
         return {"ok": True, "request": body, "response": resp}
     except httpx.HTTPStatusError as e:
         detail = ""
