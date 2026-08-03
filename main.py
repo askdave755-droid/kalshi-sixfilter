@@ -63,26 +63,37 @@ SERIES_SYMBOLS = {
     "KXEURUSD": "EURUSDT",   # Binance EURUSDT ~ EURUSD spot
 }
 
-def _edge_value():
-    raw = env("EDGE_THRESHOLD", "MIN_EDGE_PERCENT", default="0.08")
+def env_int(*names, default=0):
+    """Parse ints robustly: '1', '1.0', '2.0' all work."""
+    raw = env(*names, default=str(default))
     try:
-        v = float(raw)
-    except ValueError:
-        return 0.08
+        return int(float(raw))
+    except (ValueError, TypeError):
+        return default
+
+def env_float(*names, default=0.0):
+    raw = env(*names, default=str(default))
+    try:
+        return float(raw)
+    except (ValueError, TypeError):
+        return default
+
+def _edge_value():
+    v = env_float("EDGE_THRESHOLD", "MIN_EDGE_PERCENT", default=0.08)
     if v > 1:        # MIN_EDGE_PERCENT may be given as a percent: 8 -> 0.08
         v = v / 100.0
     return v
 
 EDGE_THRESHOLD = _edge_value()                                   # minimum model-vs-market edge
-TRADE_SIZE = int(env("TRADE_SIZE", "CONTRACT_SIZE", default="1"))  # contracts per trade
-MAX_TRADES_PER_DAY = int(env("MAX_TRADES_PER_DAY", default="10"))
-DAILY_LOSS_LIMIT = float(env("DAILY_LOSS_LIMIT", default="0"))   # dollars spent/day cap; 0 = off
-MIN_MINUTES_TO_EXPIRY = float(env("MIN_MINUTES_TO_EXPIRY", default="3"))
-MAX_MINUTES_TO_EXPIRY = float(env("MAX_MINUTES_TO_EXPIRY", default="60"))
-MIN_PRICE_CENTS = int(env("MIN_PRICE_CENTS", default="10"))
-MAX_PRICE_CENTS = int(env("MAX_PRICE_CENTS", default="90"))
-SCAN_INTERVAL_SEC = int(env("SCAN_INTERVAL_SEC", "SCAN_INTERVAL", default="60"))
-ATTEMPT_COOLDOWN_SEC = int(env("ATTEMPT_COOLDOWN_SEC", default="900"))  # 15 min
+TRADE_SIZE = env_int("TRADE_SIZE", "CONTRACT_SIZE", default=1)     # contracts per trade
+MAX_TRADES_PER_DAY = env_int("MAX_TRADES_PER_DAY", default=10)
+DAILY_LOSS_LIMIT = env_float("DAILY_LOSS_LIMIT", default=0.0)    # dollars spent/day cap; 0 = off
+MIN_MINUTES_TO_EXPIRY = env_float("MIN_MINUTES_TO_EXPIRY", default=3.0)
+MAX_MINUTES_TO_EXPIRY = env_float("MAX_MINUTES_TO_EXPIRY", default=60.0)
+MIN_PRICE_CENTS = env_int("MIN_PRICE_CENTS", default=10)
+MAX_PRICE_CENTS = env_int("MAX_PRICE_CENTS", default=90)
+SCAN_INTERVAL_SEC = env_int("SCAN_INTERVAL_SEC", "SCAN_INTERVAL", default=60)
+ATTEMPT_COOLDOWN_SEC = env_int("ATTEMPT_COOLDOWN_SEC", default=900)  # 15 min
 AUTO_TRADE = env("AUTO_TRADE", default="true").lower() == "true"
 
 TELEGRAM_BOT_TOKEN = env("TELEGRAM_BOT_TOKEN")
