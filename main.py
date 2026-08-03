@@ -576,3 +576,27 @@ load(); setInterval(load, 10000);
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
     return DASH_HTML
+@app.get("/debug/markets")
+async def debug_markets(series: str = "KXBTC15M"):
+    data = await kalshi_get("/markets", params={"series_ticker": series, "limit": 10})
+    mkts = data.get("markets", [])
+    now = time.time()
+    out = []
+    for m in mkts[:5]:
+        exp = m.get("expiration_time") or m.get("close_time")
+        mins = None
+        try:
+            mins = round((datetime.fromisoformat(str(exp).replace("Z", "+00:00")).timestamp() - now) / 60, 1)
+        except Exception:
+            pass
+        out.append({
+            "ticker": m.get("ticker"),
+            "status": m.get("status"),
+            "expiration_time": exp,
+            "mins_to_expiry": mins,
+            "yes_bid": m.get("yes_bid"),
+            "yes_ask": m.get("yes_ask"),
+            "floor_strike": m.get("floor_strike"),
+            "strike_type": m.get("strike_type"),
+        })
+    return {"count": len(mkts), "markets": out}
