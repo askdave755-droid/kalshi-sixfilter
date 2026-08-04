@@ -385,19 +385,30 @@ async def analyze_series(series: str, execute: bool = False):
         result["reason"] = "model has no directional edge (near 50/50)"
         return result
 
-    # Filter 5 — edge vs market price
+    # Filter 5 — edge vs market price, WITH the Consensus Gate.
+    # Hard-won rule: never fight the market's directional lean. Across this
+    # project, direction-disagreement trades went ~0-13 while agreement
+    # trades went 6-1. The model sizes probability well (calibration proven)
+    # but cannot see order flow; the market points, the model sizes.
+    # Buy YES only when market mid leans up, NO only when it leans down.
+    mid = (yes_bid + yes_ask) / 2.0
     edge_yes = p - yes_ask / 100.0
     edge_no = (yes_bid / 100.0) - p
-    if edge_yes >= edge_no and edge_yes >= EDGE_THRESHOLD:
+    if edge_yes >= edge_no and edge_yes >= EDGE_THRESHOLD and mid >= 50:
         side, price_c, edge = "yes", yes_ask, edge_yes
-    elif edge_no > edge_yes and edge_no >= EDGE_THRESHOLD:
+    elif edge_no > edge_yes and edge_no >= EDGE_THRESHOLD and mid < 50:
         side, price_c, edge = "no", 100.0 - yes_bid, edge_no
     else:
         side, price_c, edge = None, None, max(edge_yes, edge_no)
     f["edge"] = side is not None
     result.update(edge=round(edge, 4), side=side, limit_price_cents=price_c)
     if not f["edge"]:
-        result["reason"] = f"edge {round(edge, 3)} below threshold {EDGE_THRESHOLD}"
+        leaning = "up" if mid >= 50 else "down"
+        would = "yes" if edge_yes >= edge_no else "no"
+        if (would == "yes") != (mid >= 50) and max(edge_yes, edge_no) >= EDGE_THRESHOLD:
+            result["reason"] = f"edge {round(edge, 3)} but AGAINST market lean ({leaning}) - consensus gate"
+        else:
+            result["reason"] = f"edge {round(edge, 3)} below threshold {EDGE_THRESHOLD}"
         return result
 
     # Filter 6 — risk limits (trade count, duplicates, cooldown, daily spend cap)
