@@ -10,7 +10,9 @@ What it does:
 - Trades only when model edge beats the market price by EDGE_THRESHOLD
 - 6-filter gate before every order + daily risk limits
 - Telegram notifications + command bot
+- Polymarket read-only intel scanner (whale radar + verified pair gaps), /poly
 - Endpoints: /health /status /balance /scan /trade /dashboard /webhook/telegram
+             /poly /poly/board
 """
 
 import os
@@ -108,6 +110,30 @@ AUTO_TRADE = env("AUTO_TRADE", default="true").lower() == "true"
 
 TELEGRAM_BOT_TOKEN = env("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = env("TELEGRAM_CHAT_ID")
+
+# ---------------------------------------------------- polymarket scanner ----
+# Read-only intelligence feed. No Polymarket account or keys needed: the gamma
+# (markets) and data-api (trades) endpoints are public. Three jobs:
+#   1. whale radar  - large prints, Telegram alert
+#   2. theme board  - top markets + markets matching POLY_WATCH_KEYWORDS
+#   3. pair gaps    - user-verified Kalshi<->Polymarket equivalent contracts:
+#                     POLY_KALSHI_PAIRS="substr-in-poly-question:KALSHI-TICKER, ..."
+#                     We only trust gaps on pairs YOU confirmed have identical
+#                     resolution terms - auto-matching different contracts is
+#                     how "riskless" arb blows up.
+POLY_ENABLED = env("POLY_ENABLED", default="true").lower() in ("1", "true", "yes")
+POLY_SCAN_SEC = env_int("POLY_SCAN_SEC", default=300)
+POLY_WHALE_MIN_USD = env_float("POLY_WHALE_MIN_USD", default=25000.0)
+POLY_GAP_ALERT_C = env_float("POLY_GAP_ALERT_C", default=3.0)
+POLY_WATCH_KEYWORDS = [w.strip().lower() for w in env(
+    "POLY_WATCH_KEYWORDS", default="bitcoin,ethereum").split(",") if w.strip()]
+POLY_KALSHI_PAIRS = []
+for _pair in env("POLY_KALSHI_PAIRS", default="").split(","):
+    if ":" in _pair:
+        _sub, _tick = _pair.split(":", 1)
+        POLY_KALSHI_PAIRS.append((_sub.strip().lower(), _tick.strip()))
+POLY_GAMMA = "https://gamma-api.polymarket.com"
+POLY_DATA = "https://data-api.polymarket.com"
 
 # ------------------------------------------------------------- kalshi auth --
 _PRIVATE_KEY = None
@@ -665,6 +691,177 @@ async def auto_loop():
             log.error(f"position monitor error: {e}")
         await asyncio.sleep(SCAN_INTERVAL_SEC)
 
+# --------------------------------------------- polymarket intelligence ------
+POLY_STATE = {
+    "reachable": None,          # None = not probed yet, True/False after
+    "last_scan": None,
+    "last_error": None,
+    "markets_seen": 0,
+    "board": [],                # top markets by 24h volume (for /poly page)
+    "watched": [],              # markets matching POLY_WATCH_KEYWORDS
+    "whales": [],               # last 25 whale prints
+    "gaps": [],                 # last 25 pair-gap readings
+    "seen_trades": set(),       # dedupe whale alerts
+    "gap_alerted_at": {},       # pair -> epoch, 1 alert/hour max
+}
+
+async def poly_get(url: str, params: dict | None = None):
+    async with httpx.AsyncClient(timeout=15) as c:
+        r = await c.get(url, params=params,
+                        headers={"User-Agent": "sixfilter-scanner/1.0"})
+        r.raise_for_status()
+        return r.json()
+
+def _poly_yes_price(m: dict):
+    """Gamma returns outcomes/outcomePrices as JSON strings."""
+    try:
+        import json as _json
+        outs = m.get("outcomes"); prices = m.get("outcomePrices")
+        if isinstance(outs, str): outs = _json.loads(outs)
+        if isinstance(prices, str): prices = _json.loads(prices)
+        for name, px in zip(outs or [], prices or []):
+            if str(name).strip().lower() == "yes":
+                return float(px) * 100.0
+        if prices:
+            return float(prices[0]) * 100.0
+    except Exception:
+        pass
+    return None
+
+async def poly_scan_once():
+    """One full sweep: board + whales + watched themes + pair gaps."""
+    # --- markets board (top by 24h volume) ---
+    markets = await poly_get(f"{POLY_GAMMA}/markets", params={
+        "active": "true", "closed": "false", "limit": 60,
+        "order": "volume24hr", "ascending": "false"})
+    if isinstance(markets, dict):
+        markets = markets.get("markets") or markets.get("data") or []
+    POLY_STATE["reachable"] = True
+    POLY_STATE["markets_seen"] = len(markets)
+
+    board = []
+    watched = []
+    for m in markets:
+        q = m.get("question") or m.get("title") or ""
+        yes = _poly_yes_price(m)
+        row = {
+            "question": q[:110],
+            "yes_c": round(yes, 1) if yes is not None else None,
+            "vol24h": round(float(m.get("volume24hr") or m.get("volume") or 0)),
+            "liquidity": round(float(m.get("liquidity") or 0)),
+            "ends": str(m.get("endDate") or m.get("end_date") or "")[:10],
+            "slug": m.get("slug") or "",
+        }
+        board.append(row)
+        if any(k in q.lower() or k in row["slug"].lower() for k in POLY_WATCH_KEYWORDS):
+            watched.append(row)
+    POLY_STATE["board"] = board[:25]
+    POLY_STATE["watched"] = watched[:25]
+
+    # --- whale radar ---
+    trades = await poly_get(f"{POLY_DATA}/trades", params={"limit": 200})
+    if isinstance(trades, dict):
+        trades = trades.get("trades") or trades.get("data") or []
+    seen = POLY_STATE["seen_trades"]
+    for t in trades:
+        tid = t.get("transactionHash") or t.get("id") or f"{t.get('timestamp')}{t.get('proxyWallet')}{t.get('size')}"
+        if tid in seen:
+            continue
+        seen.add(tid)
+        try:
+            usd = float(t.get("size") or 0) * float(t.get("price") or 0)
+        except (TypeError, ValueError):
+            continue
+        if usd < POLY_WHALE_MIN_USD:
+            continue
+        row = {
+            "ts": datetime.fromtimestamp(int(t.get("timestamp", 0)), tz=timezone.utc).strftime("%m-%d %H:%M")
+                  if str(t.get("timestamp", "")).isdigit() else "?",
+            "usd": round(usd),
+            "side": t.get("side") or "?",
+            "price_c": round(float(t.get("price") or 0) * 100, 1),
+            "title": (t.get("title") or t.get("market") or "?")[:90],
+            "outcome": t.get("outcome") or "?",
+            "wallet": str(t.get("proxyWallet") or "")[:10],
+        }
+        POLY_STATE["whales"].insert(0, row)
+        await tg_send(
+            f"POLY WHALE ${row['usd']:,}\n"
+            f"{row['side']} {row['outcome']} @ {row['price_c']}c\n"
+            f"{row['title']}\n"
+            f"wallet {row['wallet']}... | {row['ts']} UTC")
+    POLY_STATE["whales"] = POLY_STATE["whales"][:25]
+    if len(seen) > 5000:
+        POLY_STATE["seen_trades"] = set(list(seen)[-2000:])
+
+    # --- verified pair gaps (manual pairs only, by design) ---
+    for sub, ticker in POLY_KALSHI_PAIRS:
+        match = next((m for m in markets
+                      if sub in (m.get("question") or "").lower()
+                      or sub in (m.get("slug") or "").lower()), None)
+        if match is None:
+            try:
+                res = await poly_get(f"{POLY_GAMMA}/markets",
+                                     params={"slug": sub, "limit": 1})
+                if isinstance(res, list) and res:
+                    match = res[0]
+            except Exception:
+                pass
+        if match is None:
+            continue
+        poly_yes = _poly_yes_price(match)
+        try:
+            km = (await kalshi_get(f"/markets/{ticker}")).get("market", {})
+            kbid, kask = cents(km, "yes_bid"), cents(km, "yes_ask")
+            kalshi_mid = (kbid + kask) / 2.0 if kbid is not None and kask is not None else None
+        except Exception as e:
+            log.warning(f"pair gap kalshi fetch {ticker}: {e}")
+            continue
+        if poly_yes is None or kalshi_mid is None:
+            continue
+        gap = poly_yes - kalshi_mid
+        row = {"pair": f"{sub}:{ticker}", "poly_c": round(poly_yes, 1),
+               "kalshi_c": round(kalshi_mid, 1), "gap_c": round(gap, 1),
+               "ts": datetime.now(timezone.utc).strftime("%m-%d %H:%M")}
+        POLY_STATE["gaps"].insert(0, row)
+        last = POLY_STATE["gap_alerted_at"].get(row["pair"], 0)
+        if abs(gap) >= POLY_GAP_ALERT_C and time.time() - last > 3600:
+            POLY_STATE["gap_alerted_at"][row["pair"]] = time.time()
+            cheaper = "KALSHI" if gap > 0 else "POLY"
+            await tg_send(
+                f"POLY-KALSHI GAP {abs(gap):.1f}c\n"
+                f"{(match.get('question') or sub)[:80]}\n"
+                f"Polymarket YES {poly_yes:.1f}c / Kalshi mid {kalshi_mid:.1f}c\n"
+                f"cheaper side: {cheaper} - CHECK RESOLUTION TERMS FIRST")
+    POLY_STATE["gaps"] = POLY_STATE["gaps"][:25]
+    POLY_STATE["last_scan"] = datetime.now(timezone.utc).isoformat()
+
+async def poly_loop():
+    await asyncio.sleep(15)
+    if not POLY_ENABLED:
+        log.info("polymarket scanner disabled (POLY_ENABLED=false)")
+        return
+    # startup probe - tells us in the logs within seconds if Railway can
+    # reach Polymarket at all (the sandbox this code was written in cannot)
+    try:
+        await poly_get(f"{POLY_GAMMA}/markets", params={"limit": 1})
+        POLY_STATE["reachable"] = True
+        log.info("POLYMARKET: reachable - scanner online")
+        await tg_send("Polymarket scanner online (read-only). Whale radar + gap watch active.")
+    except Exception as e:
+        POLY_STATE["reachable"] = False
+        POLY_STATE["last_error"] = str(e)
+        log.error(f"POLYMARKET: UNREACHABLE from this host: {e}")
+        await tg_send(f"Polymarket scanner CANNOT reach Polymarket from Railway: {e}")
+        return
+    while True:
+        try:
+            await poly_scan_once()
+        except Exception as e:
+            POLY_STATE["last_error"] = str(e)
+            log.error(f"poly scan error: {e}")
+        await asyncio.sleep(POLY_SCAN_SEC)
+
 # -------------------------------------------------------------------- app ---
 app = FastAPI(title="SixFilter Kalshi Trader API", docs_url="/docs")
 
@@ -672,6 +869,7 @@ app = FastAPI(title="SixFilter Kalshi Trader API", docs_url="/docs")
 async def _startup():
     load_key()
     asyncio.create_task(auto_loop())
+    asyncio.create_task(poly_loop())
 
 # ------------------------------------------- offline model calibration test ---
 async def _fetch_klines(symbol: str, days: int):
@@ -1010,3 +1208,74 @@ async def debug_market(ticker: str):
         "can_close_early": m.get("can_close_early"),
         "raw": m,
     }
+@app.get("/poly")
+def poly_status():
+    """Polymarket scanner state (JSON)."""
+    return {
+        "enabled": POLY_ENABLED,
+        "reachable": POLY_STATE["reachable"],
+        "last_scan": POLY_STATE["last_scan"],
+        "last_error": POLY_STATE["last_error"],
+        "markets_seen": POLY_STATE["markets_seen"],
+        "whale_min_usd": POLY_WHALE_MIN_USD,
+        "gap_alert_c": POLY_GAP_ALERT_C,
+        "watch_keywords": POLY_WATCH_KEYWORDS,
+        "pairs": [f"{a}:{b}" for a, b in POLY_KALSHI_PAIRS],
+        "whales": POLY_STATE["whales"],
+        "gaps": POLY_STATE["gaps"],
+        "watched": POLY_STATE["watched"],
+        "board": POLY_STATE["board"],
+    }
+
+@app.get("/poly/board", response_class=HTMLResponse)
+def poly_board():
+    """Mobile-friendly Polymarket intel page - open from your phone."""
+    def esc(s):
+        return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+    reach = POLY_STATE["reachable"]
+    badge = ("<span style='color:#0a0'>REACHABLE</span>" if reach else
+             "<span style='color:#c00'>UNREACHABLE</span>" if reach is False else
+             "<span style='color:#fa0'>PROBING...</span>")
+    rows_w = "".join(
+        f"<tr><td>${w['usd']:,}</td><td>{esc(w['side'])} {esc(w['outcome'])}</td>"
+        f"<td>{w['price_c']}c</td><td>{esc(w['title'])}</td><td>{w['ts']}</td></tr>"
+        for w in POLY_STATE["whales"]) or "<tr><td colspan=5>no whale prints yet</td></tr>"
+    rows_g = "".join(
+        f"<tr><td>{esc(g['pair'])}</td><td>{g['poly_c']}c</td><td>{g['kalshi_c']}c</td>"
+        f"<td><b>{g['gap_c']:+}c</b></td><td>{g['ts']}</td></tr>"
+        for g in POLY_STATE["gaps"]) or "<tr><td colspan=5>no pairs configured (set POLY_KALSHI_PAIRS)</td></tr>"
+    rows_t = "".join(
+        f"<tr><td>{esc(m['question'])}</td><td>{m['yes_c']}c</td>"
+        f"<td>${m['vol24h']:,}</td><td>{m['ends']}</td></tr>"
+        for m in POLY_STATE["watched"]) or "<tr><td colspan=4>no watched-theme markets found</td></tr>"
+    rows_b = "".join(
+        f"<tr><td>{esc(m['question'])}</td><td>{m['yes_c']}c</td>"
+        f"<td>${m['vol24h']:,}</td><td>{m['ends']}</td></tr>"
+        for m in POLY_STATE["board"]) or "<tr><td colspan=4>board empty</td></tr>"
+    return f"""<!doctype html><html><head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="120">
+<title>Polymarket Intel</title>
+<style>
+body{{font-family:-apple-system,system-ui,sans-serif;margin:12px;background:#0d1117;color:#e6edf3}}
+h2{{font-size:1.05em;margin:18px 0 6px}}
+table{{border-collapse:collapse;width:100%;font-size:.82em}}
+td,th{{border:1px solid #30363d;padding:5px 6px;text-align:left;vertical-align:top}}
+th{{background:#161b22}}
+.card{{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:10px;margin-bottom:8px}}
+</style></head><body>
+<div class="card"><b>Polymarket Scanner</b> &nbsp; {badge} &nbsp;
+last scan: {POLY_STATE['last_scan'] or 'never'}<br>
+markets seen: {POLY_STATE['markets_seen']} &nbsp;
+whale threshold: ${POLY_WHALE_MIN_USD:,.0f} &nbsp;
+error: {esc(POLY_STATE['last_error'] or '-')}
+<br><small>read-only - auto-refreshes every 2 min</small></div>
+<h2>Whale prints (last 25)</h2>
+<table><tr><th>Size</th><th>Side</th><th>Px</th><th>Market</th><th>UTC</th></tr>{rows_w}</table>
+<h2>Verified Kalshi pairs - gap watch</h2>
+<table><tr><th>Pair</th><th>Poly YES</th><th>Kalshi mid</th><th>Gap</th><th>UTC</th></tr>{rows_g}</table>
+<h2>Watched themes ({', '.join(POLY_WATCH_KEYWORDS)})</h2>
+<table><tr><th>Market</th><th>YES</th><th>24h Vol</th><th>Ends</th></tr>{rows_t}</table>
+<h2>Top markets by 24h volume</h2>
+<table><tr><th>Market</th><th>YES</th><th>24h Vol</th><th>Ends</th></tr>{rows_b}</table>
+</body></html>"""
