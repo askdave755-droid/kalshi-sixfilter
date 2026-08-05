@@ -97,6 +97,9 @@ ATTEMPT_COOLDOWN_SEC = env_int("ATTEMPT_COOLDOWN_SEC", default=900)  # 15 min
 # Extra cents bid past the quoted price so IOC orders still fill when the
 # botted books flicker between scan and order arrival. 0 = exact price only.
 TAKER_BUFFER_CENTS = env_float("TAKER_BUFFER_CENTS", default=1.0)
+# Crash-fill guard: if a fill still lands below this price, sell it straight back.
+# (Gate + MIN_PRICE see a scan snapshot; the fill sees the book 1-60s later.)
+FILL_FLOOR_CENTS = env_float("FILL_FLOOR_CENTS", default=48.0)
 # Take-profit watchdog: once a position's market bid is this many cents above
 # entry, sell it back before settlement and lock the gain. 0 = disabled
 # (hold everything to settlement). Exits never count against daily trade caps.
@@ -400,7 +403,6 @@ async def analyze_series(series: str, execute: bool = False):
         side, price_c, edge = "no", 100.0 - yes_bid, edge_no
     else:
         side, price_c, edge = None, None, max(edge_yes, edge_no)
-    log.info(f"{ticker} gate: mid={mid:.1f} p={p:.3f} edge_yes={edge_yes:.3f} edge_no={edge_no:.3f} -> side={side}")
     f["edge"] = side is not None
     result.update(edge=round(edge, 4), side=side, limit_price_cents=price_c)
     if not f["edge"]:
@@ -433,6 +435,18 @@ async def analyze_series(series: str, execute: bool = False):
 
     if execute:
         STATE["attempt_cooldown"][ticker] = time.time()
+        # GUARD 1 - fresh-quote re-check: the gate trusted a snapshot up to one
+        # scan interval old. Re-read the live book at order time; if the lean
+        # is gone, abort cleanly (no order, no cost, not counted).
+        ok_fresh, fresh_px, fresh_mid = await fresh_gate_recheck(ticker, side)
+        if not ok_fresh:
+            result["proceed"] = False
+            result["reason"] = "fresh-quote abort: book moved against the gate"
+            await tg_send(
+                f"ORDER ABORTED\n{ticker}\nbook moved against the gate at order time"
+                f" (mid now {'?' if fresh_mid is None else round(fresh_mid, 1)}c) - no order sent")
+            return result
+        price_c = fresh_px  # re-price off the LIVE book, not the stale snapshot
         order = await place_order(ticker, side, price_c, TRADE_SIZE)
         result["order"] = order
         if order.get("ok"):
@@ -442,10 +456,10 @@ async def analyze_series(series: str, execute: bool = False):
                 STATE["trades_today"] += 1
                 STATE["spent_today_cents"] += (price_c + TAKER_BUFFER_CENTS) * min(filled_n, float(TRADE_SIZE))
                 STATE["traded_tickers"].append(ticker)
-                STATE["open_positions"].append({
-                    "ticker": ticker, "side": side,
-                    "count": min(filled_n, float(TRADE_SIZE)),
-                    "entry_c": price_c + TAKER_BUFFER_CENTS, "ts": time.time()})
+                pos = {"ticker": ticker, "side": side,
+                       "count": min(filled_n, float(TRADE_SIZE)),
+                       "entry_c": price_c + TAKER_BUFFER_CENTS, "ts": time.time()}
+                STATE["open_positions"].append(pos)
                 tag = "FILLED" if filled_n >= TRADE_SIZE else f"PARTIAL {filled_n:g}/{TRADE_SIZE}"
             else:
                 tag = "NOT FILLED (book moved - no cost, not counted)"
@@ -453,9 +467,70 @@ async def analyze_series(series: str, execute: bool = False):
                 f"ORDER {tag}\n{ticker}\nbuy {side.upper()} x{TRADE_SIZE} @ {round(price_c, 1)}c\n"
                 f"model {round(p, 3)} - edge {round(edge, 3)} - expires in {round(mins, 1)}m"
             )
+            if filled_n > 0:
+                # GUARD 2 - crash-fill dump: a limit price is a cap, not a floor.
+                # If the book crashed through us and the fill landed below the
+                # floor, we hold a falling knife: sell it straight back.
+                fill_px = await actual_fill_price_cents(ticker, side, order)
+                if fill_px is not None and fill_px < FILL_FLOOR_CENTS:
+                    if await close_position(
+                            pos, f"crash-fill guard: filled {round(fill_px, 1)}c < {FILL_FLOOR_CENTS:g}c"):
+                        STATE["open_positions"].remove(pos)
         else:
             await tg_send(f"ORDER FAILED\n{ticker}\n{order.get('error')}")
     return result
+
+# --------------------------------------------------- fill-quality guards ---
+# Hard-won lesson (Aug 3-5 ledger): the Consensus Gate evaluates a scan
+# snapshot, but the IOC fills against the book 1-60s LATER. A limit price is a
+# cap, not a floor - when the book crashes through the limit, we fill at the
+# crashed price (31 fills <50c went 5W-26L, -$6.92: falling knives). When the
+# book moves away, the IOC cancels harmlessly (82 cancels, 48% fill rate).
+# Guard 1 re-checks the LIVE book at order time; Guard 2 dumps any fill that
+# still lands below FILL_FLOOR_CENTS.
+async def fresh_gate_recheck(ticker: str, side: str):
+    """Re-read the live book immediately before ordering. Returns
+    (ok, fresh_price_c, mid): ok=False means abort - do not send the order."""
+    try:
+        data = await kalshi_get(f"/markets/{ticker}")
+        m = data.get("market", {})
+        if str(m.get("status", "")).lower() not in ("open", "active", "initialized"):
+            return False, None, None
+        bid, ask = cents(m, "yes_bid"), cents(m, "yes_ask")
+        if bid is None or ask is None:
+            return False, None, None
+        mid = (bid + ask) / 2.0
+        if side == "yes":
+            return (mid >= 50.0), ask, mid          # re-priced at the LIVE ask
+        return (mid < 50.0), (100.0 - bid), mid     # NO priced off the LIVE bid
+    except Exception as e:
+        log.error(f"fresh quote {ticker}: {e}")
+        return False, None, None
+
+async def actual_fill_price_cents(ticker: str, side: str, order: dict):
+    """Our real execution price in `side` cents (None if it can't be found)."""
+    try:
+        await asyncio.sleep(0.7)  # let the fill post to the ledger
+        data = await kalshi_get(f"/portfolio/fills?ticker={ticker}&limit=5")
+        fills = data.get("fills") or []
+        if not fills:
+            return None
+        oid = ((order.get("response") or {}).get("order") or {}).get("order_id")
+        pick = None
+        if oid:
+            pick = next((f0 for f0 in fills if f0.get("order_id") == oid), None)
+        if pick is None:
+            pick = fills[0]  # newest fill on this ticker: ours, one order per cooldown
+        raw = pick.get("yes_price") if side == "yes" else pick.get("no_price")
+        if raw is None:
+            raw = pick.get("price")
+        if raw is None:
+            return None
+        v = float(raw)
+        return v * 100.0 if v <= 1.0 else v   # tolerate dollar or cent encoding
+    except Exception as e:
+        log.error(f"fill price {ticker}: {e}")
+        return None
 
 async def place_order(ticker: str, side: str, price_cents: float, count: int, reduce_only: bool = False):
     """Kalshi Create Order V2: /portfolio/events/orders.
