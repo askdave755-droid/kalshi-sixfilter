@@ -90,7 +90,7 @@ MAX_TRADES_PER_DAY = env_int("MAX_TRADES_PER_DAY", default=10)
 DAILY_LOSS_LIMIT = env_float("DAILY_LOSS_LIMIT", default=0.0)    # dollars spent/day cap; 0 = off
 MIN_MINUTES_TO_EXPIRY = env_float("MIN_MINUTES_TO_EXPIRY", default=3.0)
 MAX_MINUTES_TO_EXPIRY = env_float("MAX_MINUTES_TO_EXPIRY", default=60.0)
-MIN_PRICE_CENTS = env_int("MIN_PRICE_CENTS", default=10)
+MIN_PRICE_CENTS = env_int("MIN_PRICE_CENTS", default=48)
 MAX_PRICE_CENTS = env_int("MAX_PRICE_CENTS", default=90)
 SCAN_INTERVAL_SEC = env_int("SCAN_INTERVAL_SEC", "SCAN_INTERVAL", default=60)
 ATTEMPT_COOLDOWN_SEC = env_int("ATTEMPT_COOLDOWN_SEC", default=900)  # 15 min
@@ -400,6 +400,7 @@ async def analyze_series(series: str, execute: bool = False):
         side, price_c, edge = "no", 100.0 - yes_bid, edge_no
     else:
         side, price_c, edge = None, None, max(edge_yes, edge_no)
+    log.info(f"{ticker} gate: mid={mid:.1f} p={p:.3f} edge_yes={edge_yes:.3f} edge_no={edge_no:.3f} -> side={side}")
     f["edge"] = side is not None
     result.update(edge=round(edge, 4), side=side, limit_price_cents=price_c)
     if not f["edge"]:
