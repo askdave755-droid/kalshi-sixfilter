@@ -17,6 +17,10 @@ PATCHES vs previous build:
 5. Filter 2 two-sided liquidity check: price floor now applies to the side
    being traded (YES ask OR NO price = 100 - yes_bid). Previously down-leaning
    markets were rejected before NO could be evaluated -> 85 YES / 1 NO skew.
+6. Fill-price lookup auth fix: /portfolio/fills query params now go through
+   kalshi_get's params arg. Embedding them in the URL broke the Kalshi request
+   signature (401 Unauthorized on every lookup) which disabled the crash-fill
+   dump guard. Confirmed in Railway logs Aug 7.
 """
 
 import os
@@ -543,7 +547,11 @@ async def actual_fill_price_cents(ticker: str, side: str, order: dict):
     for attempt, wait in enumerate((1.5, 2.0), start=1):
         try:
             await asyncio.sleep(wait)
-            data = await kalshi_get(f"/portfolio/fills?ticker={ticker}&limit=5")
+            # PATCH 6: params must go through kalshi_get's params arg, NOT in
+            # the URL - the auth signature covers the path only, and signing
+            # a URL with a query string gets a 401 from Kalshi. This was the
+            # root cause of every "FILL PRICE UNVERIFIED" alert (Aug 7 logs).
+            data = await kalshi_get("/portfolio/fills", params={"ticker": ticker, "limit": 5})
             fills = data.get("fills") or []
             if not fills:
                 log.warning(f"fill price {ticker}: no fills yet (attempt {attempt})")
