@@ -14,6 +14,9 @@ PATCHES vs previous build:
    knives through to settlement).
 4. New /backtest/pnl endpoint: replays strategy P&L (not just calibration)
    over historical windows using the production model + price-band logic.
+5. Filter 2 two-sided liquidity check: price floor now applies to the side
+   being traded (YES ask OR NO price = 100 - yes_bid). Previously down-leaning
+   markets were rejected before NO could be evaluated -> 85 YES / 1 NO skew.
 """
 
 import os
@@ -357,7 +360,10 @@ async def analyze_series(series: str, execute: bool = False):
     ticker = m.get("ticker", "")
     result.update(ticker=ticker, minutes_to_expiry=round(mins, 1))
 
-    # Filter 2 — prices exist and sit inside tradable bounds
+    # Filter 2 — prices exist and sit inside tradable bounds.
+    # PATCH 5: check BOTH sides. A down-leaning market has a cheap YES ask
+    # but an expensive NO (100 - yes_bid). Checking yes_ask alone made NO
+    # trades structurally impossible (Aug 2-5 ledger: 85 YES / 1 NO).
     yes_ask, yes_bid = cents(m, "yes_ask"), cents(m, "yes_bid")
     strike = strike_of(m)
     strike_type = (m.get("strike_type") or "greater").lower()
@@ -365,9 +371,12 @@ async def analyze_series(series: str, execute: bool = False):
         market_status=(m.get("status") or "").lower(),
         yes_bid=yes_bid, yes_ask=yes_ask, strike=strike,
     )
+    no_price = (100.0 - yes_bid) if yes_bid is not None else None
+    yes_ok = yes_ask is not None and MIN_PRICE_CENTS <= yes_ask <= MAX_PRICE_CENTS
+    no_ok = no_price is not None and MIN_PRICE_CENTS <= no_price <= MAX_PRICE_CENTS
     f["liquidity"] = (
         yes_ask is not None and yes_bid is not None and strike is not None
-        and MIN_PRICE_CENTS <= yes_ask <= MAX_PRICE_CENTS
+        and (yes_ok or no_ok)
     )
     if not f["liquidity"]:
         result["reason"] = (
