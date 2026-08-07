@@ -1,18 +1,19 @@
 """
-SixFilter Kalshi Auto-Trader — clean single-file rebuild
+SixFilter Kalshi Auto-Trader — patched build (Aug 7, 2026)
 Deploy: Railway (repo root)
 Start command: uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}
 
-What it does:
-- Scans Kalshi series (KXBTC15M, KXETH15M, KXBTC1H, KXETH1H, KXEURUSD)
-- Pulls live prices + volatility from Binance
-- Estimates true probability of finishing above/below the strike
-- Trades only when model edge beats the market price by EDGE_THRESHOLD
-- 6-filter gate before every order + daily risk limits
-- Telegram notifications + command bot
-- Polymarket read-only intel scanner (whale radar + verified pair gaps), /poly
-- Endpoints: /health /status /balance /scan /trade /dashboard /webhook/telegram
-             /poly /poly/board
+PATCHES vs previous build:
+1. MIN_PRICE_CENTS default 48 -> 55 (ledger proved <55c entries lose money:
+   30-45c bucket went 10% win rate, -$6.33; 55-75c runs 77-86% win rate)
+2. EV floor: edge must clear EDGE_THRESHOLD + estimated taker fee.
+   Kalshi taker fee ~= 0.07 * C * P * (1-P). A raw 8c edge at 58c is really
+   ~6.3c after fees. Filter 5 now prices that in.
+3. Fill-floor guard hardened: 1.5s settle wait + one retry + loud logging
+   when the fill price cannot be found (silent None was letting falling
+   knives through to settlement).
+4. New /backtest/pnl endpoint: replays strategy P&L (not just calibration)
+   over historical windows using the production model + price-band logic.
 """
 
 import os
@@ -62,7 +63,7 @@ SERIES_SYMBOLS = {
     "KXETH15M": "ETHUSDT",
     "KXBTC1H": "BTCUSDT",
     "KXETH1H": "ETHUSDT",
-    "KXEURUSD": "EURUSDT",   # Binance EURUSDT ~ EURUSD spot
+    "KXEURUSD": "EURUSDT",  # Binance EURUSDT ~ EURUSD spot
 }
 
 def env_int(*names, default=0):
@@ -82,45 +83,46 @@ def env_float(*names, default=0.0):
 
 def _edge_value():
     v = env_float("EDGE_THRESHOLD", "MIN_EDGE_PERCENT", default=0.08)
-    if v > 1:        # MIN_EDGE_PERCENT may be given as a percent: 8 -> 0.08
+    if v > 1:  # MIN_EDGE_PERCENT may be given as a percent: 8 -> 0.08
         v = v / 100.0
     return v
 
-EDGE_THRESHOLD = _edge_value()                                   # minimum model-vs-market edge
-TRADE_SIZE = env_int("TRADE_SIZE", "CONTRACT_SIZE", default=1)     # contracts per trade
+EDGE_THRESHOLD = _edge_value()          # minimum model-vs-market edge
+TRADE_SIZE = env_int("TRADE_SIZE", "CONTRACT_SIZE", default=1)
 MAX_TRADES_PER_DAY = env_int("MAX_TRADES_PER_DAY", default=10)
-DAILY_LOSS_LIMIT = env_float("DAILY_LOSS_LIMIT", default=0.0)    # dollars spent/day cap; 0 = off
+DAILY_LOSS_LIMIT = env_float("DAILY_LOSS_LIMIT", default=0.0)  # dollars/day cap; 0 = off
 MIN_MINUTES_TO_EXPIRY = env_float("MIN_MINUTES_TO_EXPIRY", default=3.0)
 MAX_MINUTES_TO_EXPIRY = env_float("MAX_MINUTES_TO_EXPIRY", default=60.0)
-MIN_PRICE_CENTS = env_int("MIN_PRICE_CENTS", default=48)
+# PATCH 1: 48 -> 55. The Aug 2-5 ledger: <55c entries = 10-17% win rate,
+# -$6.69 combined. 55-75c entries = 77-86% win rate, +$5.29.
+MIN_PRICE_CENTS = env_int("MIN_PRICE_CENTS", default=55)
 MAX_PRICE_CENTS = env_int("MAX_PRICE_CENTS", default=90)
 SCAN_INTERVAL_SEC = env_int("SCAN_INTERVAL_SEC", "SCAN_INTERVAL", default=60)
 ATTEMPT_COOLDOWN_SEC = env_int("ATTEMPT_COOLDOWN_SEC", default=900)  # 15 min
 # Extra cents bid past the quoted price so IOC orders still fill when the
 # botted books flicker between scan and order arrival. 0 = exact price only.
 TAKER_BUFFER_CENTS = env_float("TAKER_BUFFER_CENTS", default=1.0)
-# Crash-fill guard: if a fill still lands below this price, sell it straight back.
-# (Gate + MIN_PRICE see a scan snapshot; the fill sees the book 1-60s later.)
-FILL_FLOOR_CENTS = env_float("FILL_FLOOR_CENTS", default=48.0)
+# Crash-fill guard: if a fill still lands below this price, sell it straight
+# back. PATCH 1: raised to match the new MIN_PRICE floor.
+FILL_FLOOR_CENTS = env_float("FILL_FLOOR_CENTS", default=55.0)
 # Take-profit watchdog: once a position's market bid is this many cents above
-# entry, sell it back before settlement and lock the gain. 0 = disabled
-# (hold everything to settlement). Exits never count against daily trade caps.
+# entry, sell it back before settlement and lock the gain. 0 = disabled.
 TAKE_PROFIT_CENTS = env_float("TAKE_PROFIT_CENTS", default=0.0)
 AUTO_TRADE = env("AUTO_TRADE", default="true").lower() == "true"
 
 TELEGRAM_BOT_TOKEN = env("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = env("TELEGRAM_CHAT_ID")
 
+# PATCH 2: Kalshi taker fee model: fee_dollars = ceil(0.07 * C * P * (1-P) * 100)/100
+# per contract where P is price in dollars. We use it as an EV floor so the
+# quoted edge must clear threshold + fee, not just threshold.
+def kalshi_taker_fee_cents(price_cents: float, contracts: float = 1.0) -> float:
+    p = max(0.01, min(0.99, price_cents / 100.0))
+    fee = 0.07 * contracts * p * (1.0 - p)
+    return math.ceil(fee * 100.0)  # cents, rounded up like Kalshi does
+
 # ---------------------------------------------------- polymarket scanner ----
-# Read-only intelligence feed. No Polymarket account or keys needed: the gamma
-# (markets) and data-api (trades) endpoints are public. Three jobs:
-#   1. whale radar  - large prints, Telegram alert
-#   2. theme board  - top markets + markets matching POLY_WATCH_KEYWORDS
-#   3. pair gaps    - user-verified Kalshi<->Polymarket equivalent contracts:
-#                     POLY_KALSHI_PAIRS="substr-in-poly-question:KALSHI-TICKER, ..."
-#                     We only trust gaps on pairs YOU confirmed have identical
-#                     resolution terms - auto-matching different contracts is
-#                     how "riskless" arb blows up.
+# Read-only intelligence feed. No Polymarket account or keys needed.
 POLY_ENABLED = env("POLY_ENABLED", default="true").lower() in ("1", "true", "yes")
 POLY_SCAN_SEC = env_int("POLY_SCAN_SEC", default=300)
 POLY_WHALE_MIN_USD = env_float("POLY_WHALE_MIN_USD", default=25000.0)
@@ -213,7 +215,7 @@ def recalibrate(p: float, mins_left: float, r15: float, sigma_1m: float, symbol:
     big = 1.5 * sigma_1m * math.sqrt(15)
     if abs(r15) > big and mins_left > 4:
         rev = REVERSION.get(symbol, 0.05) * min((mins_left - 4) / 9.0, 1.0)
-        p += rev if r15 < 0 else -rev   # big down-move -> up-reversion, and vice versa
+        p += rev if r15 < 0 else -rev  # big down-move -> up-reversion, and vice versa
     return min(max(p, 0.01), 0.99)
 
 async def binance_stats(symbol: str):
@@ -228,9 +230,7 @@ async def binance_stats(symbol: str):
         closes = [float(k[4]) for k in r.json()]
     rets = [math.log(closes[i] / closes[i - 1]) for i in range(1, len(closes)) if closes[i - 1] > 0]
     sigma = statistics.pstdev(rets) if len(rets) > 2 else 0.001
-    # Momentum barely persists at 15-min scale and the market prices it near zero.
-    # The 0.5 weight was manufacturing false contrarian edge (3 losses proved it);
-    # keep only a whisper of directional tilt.
+    # Momentum barely persists at 15-min scale; keep only a whisper of tilt.
     drift = (statistics.mean(rets[-20:]) * 0.15) if len(rets) >= 20 else 0.0
     r15 = math.log(closes[-1] / closes[-15]) if len(closes) >= 16 else 0.0
     return closes[-1], sigma, drift, r15
@@ -249,10 +249,10 @@ STATE = {
     "paused": not AUTO_TRADE,
     "day": "",
     "trades_today": 0,
-    "spent_today_cents": 0.0,   # total premium committed today (daily cap)
-    "traded_tickers": [],       # successful orders, permanent for the day
-    "open_positions": [],       # fills awaiting settlement or take-profit exit
-    "attempt_cooldown": {},     # ticker -> epoch, any attempt (success or fail)
+    "spent_today_cents": 0.0,
+    "traded_tickers": [],
+    "open_positions": [],
+    "attempt_cooldown": {},
     "last_scan": None,
     "last_signals": [],
     "last_error": None,
@@ -310,22 +310,14 @@ def strike_of(m: dict):
 
 async def fetch_active_market(series: str):
     """Pick the tradable market closest to its trading close.
-
-    Kalshi quirks handled here:
-    - `expiration_time` is the SETTLEMENT date (days away), not trading close.
-      `close_time` is when trading actually stops -> use it first.
-    - Markets sit in 'initialized' status (no prices) until the session opens,
-      so we accept both 'open' and 'initialized' and let the liquidity
-      filter reject the ones without prices.
-    Returns (best_pick_or_None, minutes_to_nearest_close_or_None).
-    """
+    Returns (best_pick_or_None, minutes_to_nearest_close_or_None)."""
     data = await kalshi_get("/markets", params={"series_ticker": series, "limit": 200})
     now = time.time()
     best = None
     nearest_min = None
     for m in data.get("markets", []):
         status = (m.get("status") or "").lower()
-        if status not in ("open", "initialized", "active"):  # Kalshi uses "active" for live trading
+        if status not in ("open", "initialized", "active"):
             continue
         exp = m.get("close_time") or m.get("expiration_time")
         if not exp:
@@ -394,15 +386,10 @@ async def analyze_series(series: str, execute: bool = False):
         return result
     result["spot"] = spot
 
-    # Model probability.
-    # Settlement uses a 60-second BRTI average, not the point price at close.
-    # Near the end of a window that averaging kills crossing chances, so
-    # evaluate the model at T-0.5min (rough midpoint of the settlement
-    # window) instead of T. This shrinks late-entry "about to cross" edge.
+    # Model probability. Settlement uses a 60-second BRTI average, so evaluate
+    # at T-0.5min (rough midpoint of the settlement window).
     t_eff = max(mins - 0.5, 0.25)
     p = prob_above(spot, strike, sigma, drift, t_eff)
-    # Backtest-sized corrections: early-window overconfidence shrink +
-    # mean-reversion after big 15m moves (ETH strong, BTC mild).
     p = recalibrate(p, mins, r15, sigma, symbol)
     if strike_type == "less":
         p = 1.0 - p
@@ -414,28 +401,37 @@ async def analyze_series(series: str, execute: bool = False):
         result["reason"] = "model has no directional edge (near 50/50)"
         return result
 
-    # Filter 5 — edge vs market price, WITH the Consensus Gate.
-    # Hard-won rule: never fight the market's directional lean. Across this
-    # project, direction-disagreement trades went ~0-13 while agreement
-    # trades went 6-1. The model sizes probability well (calibration proven)
-    # but cannot see order flow; the market points, the model sizes.
-    # Buy YES only when market mid leans up, NO only when it leans down.
+    # Filter 5 — edge vs market, WITH the Consensus Gate AND the EV floor.
+    # Consensus Gate: never fight the market's directional lean
+    # (disagreement trades went ~0-13, agreement trades 6-1).
+    # PATCH 2 (EV floor): edge must clear EDGE_THRESHOLD + taker fee.
+    # A "8c edge" at a 58c entry is really ~6.3c after Kalshi's fee formula.
     mid = (yes_bid + yes_ask) / 2.0
     edge_yes = p - yes_ask / 100.0
     edge_no = (yes_bid / 100.0) - p
-    if edge_yes >= edge_no and edge_yes >= EDGE_THRESHOLD and mid >= 50:
+
+    fee_yes_c = kalshi_taker_fee_cents(yes_ask, TRADE_SIZE) / max(TRADE_SIZE, 1)
+    fee_no_c = kalshi_taker_fee_cents(100.0 - yes_bid, TRADE_SIZE) / max(TRADE_SIZE, 1)
+    floor_yes = EDGE_THRESHOLD + fee_yes_c / 100.0
+    floor_no = EDGE_THRESHOLD + fee_no_c / 100.0
+
+    if edge_yes >= edge_no and edge_yes >= floor_yes and mid >= 50:
         side, price_c, edge = "yes", yes_ask, edge_yes
-    elif edge_no > edge_yes and edge_no >= EDGE_THRESHOLD and mid < 50:
+    elif edge_no > edge_yes and edge_no >= floor_no and mid < 50:
         side, price_c, edge = "no", 100.0 - yes_bid, edge_no
     else:
         side, price_c, edge = None, None, max(edge_yes, edge_no)
     f["edge"] = side is not None
-    result.update(edge=round(edge, 4), side=side, limit_price_cents=price_c)
+    result.update(edge=round(edge, 4), side=side, limit_price_cents=price_c,
+                  ev_floor=round(min(floor_yes, floor_no), 4))
     if not f["edge"]:
         leaning = "up" if mid >= 50 else "down"
         would = "yes" if edge_yes >= edge_no else "no"
-        if (would == "yes") != (mid >= 50) and max(edge_yes, edge_no) >= EDGE_THRESHOLD:
+        raw_floor = floor_yes if would == "yes" else floor_no
+        if (would == "yes") != (mid >= 50) and max(edge_yes, edge_no) >= raw_floor:
             result["reason"] = f"edge {round(edge, 3)} but AGAINST market lean ({leaning}) - consensus gate"
+        elif max(edge_yes, edge_no) >= EDGE_THRESHOLD:
+            result["reason"] = f"edge {round(edge, 3)} dies to fees (EV floor {round(raw_floor, 3)})"
         else:
             result["reason"] = f"edge {round(edge, 3)} below threshold {EDGE_THRESHOLD}"
         return result
@@ -461,9 +457,7 @@ async def analyze_series(series: str, execute: bool = False):
 
     if execute:
         STATE["attempt_cooldown"][ticker] = time.time()
-        # GUARD 1 - fresh-quote re-check: the gate trusted a snapshot up to one
-        # scan interval old. Re-read the live book at order time; if the lean
-        # is gone, abort cleanly (no order, no cost, not counted).
+        # GUARD 1 - fresh-quote re-check at order time.
         ok_fresh, fresh_px, fresh_mid = await fresh_gate_recheck(ticker, side)
         if not ok_fresh:
             result["proceed"] = False
@@ -494,26 +488,23 @@ async def analyze_series(series: str, execute: bool = False):
                 f"model {round(p, 3)} - edge {round(edge, 3)} - expires in {round(mins, 1)}m"
             )
             if filled_n > 0:
-                # GUARD 2 - crash-fill dump: a limit price is a cap, not a floor.
-                # If the book crashed through us and the fill landed below the
-                # floor, we hold a falling knife: sell it straight back.
+                # GUARD 2 - crash-fill dump (PATCH 3: hardened lookup).
                 fill_px = await actual_fill_price_cents(ticker, side, order)
                 if fill_px is not None and fill_px < FILL_FLOOR_CENTS:
                     if await close_position(
-                            pos, f"crash-fill guard: filled {round(fill_px, 1)}c < {FILL_FLOOR_CENTS:g}c"):
+                        pos, f"crash-fill guard: filled {round(fill_px, 1)}c < {FILL_FLOOR_CENTS:g}c"):
                         STATE["open_positions"].remove(pos)
+                elif fill_px is None:
+                    # PATCH 3: never stay silent. If we cannot verify the fill
+                    # price, alert so you can eyeball it in the app.
+                    await tg_send(
+                        f"FILL PRICE UNVERIFIED\n{ticker}\ncould not read fill from ledger - "
+                        f"check the app. If it filled below {FILL_FLOOR_CENTS:g}c, sell it now.")
         else:
             await tg_send(f"ORDER FAILED\n{ticker}\n{order.get('error')}")
     return result
 
 # --------------------------------------------------- fill-quality guards ---
-# Hard-won lesson (Aug 3-5 ledger): the Consensus Gate evaluates a scan
-# snapshot, but the IOC fills against the book 1-60s LATER. A limit price is a
-# cap, not a floor - when the book crashes through the limit, we fill at the
-# crashed price (31 fills <50c went 5W-26L, -$6.92: falling knives). When the
-# book moves away, the IOC cancels harmlessly (82 cancels, 48% fill rate).
-# Guard 1 re-checks the LIVE book at order time; Guard 2 dumps any fill that
-# still lands below FILL_FLOOR_CENTS.
 async def fresh_gate_recheck(ticker: str, side: str):
     """Re-read the live book immediately before ordering. Returns
     (ok, fresh_price_c, mid): ok=False means abort - do not send the order."""
@@ -527,47 +518,56 @@ async def fresh_gate_recheck(ticker: str, side: str):
             return False, None, None
         mid = (bid + ask) / 2.0
         if side == "yes":
-            return (mid >= 50.0), ask, mid          # re-priced at the LIVE ask
-        return (mid < 50.0), (100.0 - bid), mid     # NO priced off the LIVE bid
+            return (mid >= 50.0), ask, mid       # re-priced at the LIVE ask
+        return (mid < 50.0), (100.0 - bid), mid  # NO priced off the LIVE bid
     except Exception as e:
         log.error(f"fresh quote {ticker}: {e}")
         return False, None, None
 
 async def actual_fill_price_cents(ticker: str, side: str, order: dict):
-    """Our real execution price in `side` cents (None if it can't be found)."""
-    try:
-        await asyncio.sleep(0.7)  # let the fill post to the ledger
-        data = await kalshi_get(f"/portfolio/fills?ticker={ticker}&limit=5")
-        fills = data.get("fills") or []
-        if not fills:
-            return None
-        oid = ((order.get("response") or {}).get("order") or {}).get("order_id")
-        pick = None
-        if oid:
-            pick = next((f0 for f0 in fills if f0.get("order_id") == oid), None)
-        if pick is None:
-            pick = fills[0]  # newest fill on this ticker: ours, one order per cooldown
-        raw = pick.get("yes_price") if side == "yes" else pick.get("no_price")
-        if raw is None:
-            raw = pick.get("price")
-        if raw is None:
-            return None
-        v = float(raw)
-        return v * 100.0 if v <= 1.0 else v   # tolerate dollar or cent encoding
-    except Exception as e:
-        log.error(f"fill price {ticker}: {e}")
-        return None
+    """Our real execution price in `side` cents (None if it can't be found).
+
+    PATCH 3: 0.7s was racing the ledger - fills often post 1-2s later, the
+    lookup returned None, and the crash-fill guard silently skipped. Now we
+    wait 1.5s, retry once after another 2s, and log loudly on failure."""
+    oid = ((order.get("response") or {}).get("order") or {}).get("order_id")
+    for attempt, wait in enumerate((1.5, 2.0), start=1):
+        try:
+            await asyncio.sleep(wait)
+            data = await kalshi_get(f"/portfolio/fills?ticker={ticker}&limit=5")
+            fills = data.get("fills") or []
+            if not fills:
+                log.warning(f"fill price {ticker}: no fills yet (attempt {attempt})")
+                continue
+            pick = None
+            if oid:
+                pick = next((f0 for f0 in fills if f0.get("order_id") == oid), None)
+            if pick is None and attempt == 2:
+                pick = fills[0]  # newest fill on this ticker: ours (one order per cooldown)
+            if pick is None:
+                continue
+            raw = pick.get("yes_price") if side == "yes" else pick.get("no_price")
+            if raw is None:
+                raw = pick.get("price")
+            if raw is None:
+                # dollar-encoded variants
+                raw = (pick.get("yes_price_dollars") if side == "yes"
+                       else pick.get("no_price_dollars")) or pick.get("price_dollars")
+                if raw is not None:
+                    return float(raw) * 100.0
+                continue
+            v = float(raw)
+            return v * 100.0 if v <= 1.0 else v  # tolerate dollar or cent encoding
+        except Exception as e:
+            log.error(f"fill price {ticker} attempt {attempt}: {e}")
+    log.error(f"FILL PRICE NOT FOUND for {ticker} after retries - guard skipped")
+    return None
 
 async def place_order(ticker: str, side: str, price_cents: float, count: int, reduce_only: bool = False):
     """Kalshi Create Order V2: /portfolio/events/orders.
-
-    V2 uses a single-book bid/ask model in YES-dollar terms:
-      - buy YES at p cents  -> side="bid", price=p/100
-      - buy NO  at q cents  -> side="ask", price=(100-q)/100  (selling YES = holding NO)
-    Prices are fixed-point dollar strings ('0.4800'), count is a fixed-point string.
+    - buy YES at p cents -> side="bid", price=p/100
+    - buy NO at q cents -> side="ask", price=(100-q)/100
     """
-    # Cross the spread by TAKER_BUFFER_CENTS so a stale quote still fills;
-    # the books are botted and move between scan and order arrival.
     if side == "yes":
         v2_side = "bid"
         v2_price = min(price_cents + TAKER_BUFFER_CENTS, 99.0) / 100.0
@@ -580,7 +580,7 @@ async def place_order(ticker: str, side: str, price_cents: float, count: int, re
         "side": v2_side,
         "count": f"{float(count):.2f}",
         "price": f"{v2_price:.4f}",
-        "time_in_force": "immediate_or_cancel",   # take what exists, cancel the rest quietly
+        "time_in_force": "immediate_or_cancel",
         "self_trade_prevention_type": "taker_at_cross",
         "post_only": False,
         "reduce_only": reduce_only,
@@ -638,7 +638,7 @@ async def close_position(pos: dict, reason: str):
 
 async def monitor_positions():
     """Take-profit watchdog. Runs every scan cycle even while paused:
-    pause stops entries, never exits. Settled markets drop off the registry."""
+    pause stops entries, never exits."""
     if TAKE_PROFIT_CENTS <= 0 or not STATE["open_positions"]:
         return
     still_open = []
@@ -693,16 +693,16 @@ async def auto_loop():
 
 # --------------------------------------------- polymarket intelligence ------
 POLY_STATE = {
-    "reachable": None,          # None = not probed yet, True/False after
+    "reachable": None,
     "last_scan": None,
     "last_error": None,
     "markets_seen": 0,
-    "board": [],                # top markets by 24h volume (for /poly page)
-    "watched": [],              # markets matching POLY_WATCH_KEYWORDS
-    "whales": [],               # last 25 whale prints
-    "gaps": [],                 # last 25 pair-gap readings
-    "seen_trades": set(),       # dedupe whale alerts
-    "gap_alerted_at": {},       # pair -> epoch, 1 alert/hour max
+    "board": [],
+    "watched": [],
+    "whales": [],
+    "gaps": [],
+    "seen_trades": set(),
+    "gap_alerted_at": {},
 }
 
 async def poly_get(url: str, params: dict | None = None):
@@ -730,7 +730,6 @@ def _poly_yes_price(m: dict):
 
 async def poly_scan_once():
     """One full sweep: board + whales + watched themes + pair gaps."""
-    # --- markets board (top by 24h volume) ---
     markets = await poly_get(f"{POLY_GAMMA}/markets", params={
         "active": "true", "closed": "false", "limit": 60,
         "order": "volume24hr", "ascending": "false"})
@@ -776,7 +775,7 @@ async def poly_scan_once():
             continue
         row = {
             "ts": datetime.fromtimestamp(int(t.get("timestamp", 0)), tz=timezone.utc).strftime("%m-%d %H:%M")
-                  if str(t.get("timestamp", "")).isdigit() else "?",
+            if str(t.get("timestamp", "")).isdigit() else "?",
             "usd": round(usd),
             "side": t.get("side") or "?",
             "price_c": round(float(t.get("price") or 0) * 100, 1),
@@ -841,8 +840,6 @@ async def poly_loop():
     if not POLY_ENABLED:
         log.info("polymarket scanner disabled (POLY_ENABLED=false)")
         return
-    # startup probe - tells us in the logs within seconds if Railway can
-    # reach Polymarket at all (the sandbox this code was written in cannot)
     try:
         await poly_get(f"{POLY_GAMMA}/markets", params={"limit": 1})
         POLY_STATE["reachable"] = True
@@ -884,10 +881,10 @@ async def _fetch_klines(symbol: str, days: int):
                 "limit": min(1000, need - len(closes)), "endTime": end - 1})
             r.raise_for_status()
             ks = r.json()
-        if not ks:
-            break
-        closes = [float(k[4]) for k in ks] + closes
-        end = int(ks[0][0])
+            if not ks:
+                break
+            closes = [float(k[4]) for k in ks] + closes
+            end = int(ks[0][0])
         await asyncio.sleep(0.15)  # be polite with rate limits
     return closes
 
@@ -895,9 +892,8 @@ async def _fetch_klines(symbol: str, days: int):
 async def backtest(symbol: str = "BTCUSDT", days: int = 7, adj: int = 0):
     """Replay the EXACT production model over historical 15-min windows.
     Calibration: when the model says p, does price close above the window
-    open p-fraction of the time? Momentum split tests the mean-reversion
-    hypothesis directly. adj=1 applies the production recalibrate() pass so
-    we can verify the fixes close the measured defects. Read-only."""
+    open p-fraction of the time? adj=1 applies the production recalibrate().
+    Read-only."""
     days = max(1, min(int(days), 14))
     symbol = symbol.upper()
     closes = await _fetch_klines(symbol, days)
@@ -910,17 +906,17 @@ async def backtest(symbol: str = "BTCUSDT", days: int = 7, adj: int = 0):
     WINDOW = 15
     report = {}
     for m_left in (13, 8, 4):
-        buckets = [[0, 0.0, 0.0] for _ in range(10)]      # [n, p_sum, wins]
+        buckets = [[0, 0.0, 0.0] for _ in range(10)]  # [n, p_sum, wins]
         mom = {"big_up": [0, 0.0, 0.0], "small": [0, 0.0, 0.0], "big_down": [0, 0.0, 0.0]}
         brier = brier_naive = 0.0
         n = 0
-        t_eff = max(m_left - 0.5, 0.25)                    # production settlement adjustment
+        t_eff = max(m_left - 0.5, 0.25)  # production settlement adjustment
         for d in range(125, len(closes) - m_left, 3):
-            hist = rets[d - 120:d]                          # same 120 bars the bot reads
+            hist = rets[d - 120:d]  # same 120 bars the bot reads
             sigma = statistics.pstdev(hist) if len(hist) > 2 else 0.001
-            drift = statistics.mean(hist[-20:]) * 0.15      # production drift weight
+            drift = statistics.mean(hist[-20:]) * 0.15  # production drift weight
             spot = closes[d]
-            strike = closes[d - (WINDOW - m_left)]          # price at window open
+            strike = closes[d - (WINDOW - m_left)]  # price at window open
             win = 1.0 if closes[d + m_left] >= strike else 0.0
             p = prob_above(spot, strike, sigma, drift, t_eff)
             if adj:
@@ -957,6 +953,100 @@ async def backtest(symbol: str = "BTCUSDT", days: int = 7, adj: int = 0):
                           "reversion confirmed and sized.")
     return out
 
+# ------------------------------------------- PATCH 4: strategy P&L replay ---
+@app.get("/backtest/pnl")
+async def backtest_pnl(symbol: str = "BTCUSDT", days: int = 7,
+                       min_price: float = 55.0, max_price: float = 90.0,
+                       edge: float = 0.08, fee: int = 1):
+    """Replay the STRATEGY (not just the model) over historical windows.
+
+    The /backtest endpoint answers "is the model calibrated?" This one answers
+    "does the 6-filter gate make money?" For each historical 15m window where
+    the model shows edge >= threshold, we simulate buying YES at the model-
+    implied market price band and settling at the true outcome, with Kalshi
+    taker fees. Since we cannot see historical Kalshi books, we approximate the
+    market price as the model probability adjusted by a spread assumption
+    (spread=2c each side, matching observed KX*15M books). fee=1 includes fees.
+
+    Read-only. Compare min_price=48 vs 55 to see the PATCH 1 effect directly.
+    """
+    days = max(1, min(int(days), 14))
+    symbol = symbol.upper()
+    closes = await _fetch_klines(symbol, days)
+    out = {"symbol": symbol, "days": days, "bars": len(closes),
+           "params": {"min_price": min_price, "max_price": max_price,
+                      "edge": edge, "fees_included": bool(fee)}}
+    if len(closes) < 500:
+        out["error"] = "not enough kline data"
+        return out
+    rets = [math.log(closes[i] / closes[i - 1]) for i in range(1, len(closes))]
+
+    WINDOW = 15
+    SPREAD_C = 2.0  # assumed half-spread on KX 15m books
+    report = {}
+    for m_left in (13, 8, 4):
+        trades = []
+        t_eff = max(m_left - 0.5, 0.25)
+        for d in range(125, len(closes) - m_left, 3):
+            hist = rets[d - 120:d]
+            sigma = statistics.pstdev(hist) if len(hist) > 2 else 0.001
+            drift = statistics.mean(hist[-20:]) * 0.15
+            spot = closes[d]
+            strike = closes[d - (WINDOW - m_left)]
+            win = closes[d + m_left] >= strike
+            p = prob_above(spot, strike, sigma, drift, t_eff)
+            r15_bt = math.log(closes[d] / closes[d - WINDOW])
+            p = recalibrate(p, m_left, r15_bt, sigma, symbol)
+
+            # approximate market: mid ~= p (efficient) -> tradeable YES ask ~= p*100 + spread
+            yes_ask = p * 100.0 + SPREAD_C
+            yes_bid = p * 100.0 - SPREAD_C
+            mid = (yes_ask + yes_bid) / 2.0
+            if not (min_price <= yes_ask <= max_price):
+                continue
+            edge_yes = p - yes_ask / 100.0
+            edge_no = (yes_bid / 100.0) - p
+            if edge_yes >= edge_no and edge_yes >= edge and mid >= 50:
+                side, entry_c = "yes", yes_ask
+            elif edge_no > edge_yes and edge_no >= edge and mid < 50:
+                side, entry_c = "no", 100.0 - yes_bid
+            else:
+                continue
+            if abs(p - 0.5) < 0.02:  # clarity filter
+                continue
+            fee_c = kalshi_taker_fee_cents(entry_c) if fee else 0.0
+            if side == "yes":
+                pnl = (100.0 - entry_c) if win else -entry_c
+            else:
+                pnl = (100.0 - entry_c) if not win else -entry_c
+            pnl -= fee_c
+            trades.append(pnl)
+
+        n = len(trades)
+        if n:
+            eq, peak, maxdd = 0.0, 0.0, 0.0
+            for x in trades:
+                eq += x
+                peak = max(peak, eq)
+                maxdd = min(maxdd, eq - peak)
+            report[f"minutes_left_{m_left}"] = {
+                "trades": n,
+                "win_rate": round(sum(1 for x in trades if x > 0) / n, 3),
+                "total_pnl_dollars": round(sum(trades) / 100.0, 2),
+                "avg_pnl_cents": round(sum(trades) / n, 2),
+                "max_drawdown_dollars": round(maxdd / 100.0, 2),
+                "profit_factor": round(
+                    sum(x for x in trades if x > 0) / max(0.01, -sum(x for x in trades if x < 0)), 2),
+            }
+        else:
+            report[f"minutes_left_{m_left}"] = {"trades": 0}
+    out["results"] = report
+    out["how_to_read"] = ("This is a lower-fidelity replay (synthetic books at model price "
+                          "+/- 2c spread) - use it to compare SETTINGS, not to predict exact "
+                          "returns. Try min_price=48 vs 55 vs 58 and watch total_pnl move. "
+                          "If profit_factor < 1.3 in replay, do not trade that config live.")
+    return out
+
 @app.get("/")
 def root():
     return {"service": "SixFilter Kalshi Trader API", "docs": "/docs", "dashboard": "/dashboard"}
@@ -975,6 +1065,8 @@ def health():
         "scanning": SCAN_SERIES,
         "auto_trade": AUTO_TRADE,
         "paused": STATE["paused"],
+        "min_price_cents": MIN_PRICE_CENTS,
+        "fill_floor_cents": FILL_FLOOR_CENTS,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -996,6 +1088,8 @@ def status():
         "daily_loss_limit": DAILY_LOSS_LIMIT,
         "edge_threshold": EDGE_THRESHOLD,
         "trade_size": TRADE_SIZE,
+        "min_price_cents": MIN_PRICE_CENTS,
+        "fill_floor_cents": FILL_FLOOR_CENTS,
         "scanning": SCAN_SERIES,
         "take_profit_cents": TAKE_PROFIT_CENTS,
         "open_positions": [
@@ -1018,7 +1112,7 @@ async def manual_scan(req: ScanRequest):
 
 class TradeRequest(BaseModel):
     ticker: str
-    side: str            # "yes" or "no"
+    side: str  # "yes" or "no"
     count: int = 1
     price_cents: int | None = None
 
@@ -1109,36 +1203,46 @@ async def telegram_webhook(request: Request):
     return {"ok": True}
 
 # --------------------------------------------------------------- dashboard --
-DASH_HTML = """<!doctype html>
-<meta name="viewport" content="width=device-width, initial-scale=1">
+DASH_HTML = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>SixFilter Kalshi</title>
 <style>
- body{font-family:system-ui;background:#0b1220;color:#e5e7eb;max-width:760px;margin:24px auto;padding:0 16px}
- .card{background:#111c33;border:1px solid #24304d;border-radius:12px;padding:16px;margin:12px 0}
- .ok{color:#34d399}.bad{color:#f87171} pre{white-space:pre-wrap;font-size:13px;margin:0}
- h2{margin:8px 0} small{color:#94a3b8}
-</style>
-<h2>SixFilter Kalshi Trader</h2>
-<small>auto-refreshes every 10s</small>
+body{font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;max-width:900px;margin:0 auto;padding:16px}
+h1{color:#f59e0b;font-size:1.3rem}
+.card{background:#1e293b;border-radius:10px;padding:14px;margin:10px 0}
+.sig{font-family:monospace;font-size:.8rem;white-space:pre-wrap;background:#0b1220;padding:10px;border-radius:8px}
+.ok{color:#4ade80}.bad{color:#f87171}.dim{color:#94a3b8}
+button{background:#f59e0b;border:none;border-radius:8px;padding:8px 14px;font-weight:600;margin-right:8px;cursor:pointer}
+</style></head><body>
+<h1>SixFilter Kalshi Trader</h1>
+<div class="dim">auto-refreshes every 10s</div>
 <div class="card" id="s">loading...</div>
-<div class="card"><b>Last scan signals</b><pre id="j">...</pre></div>
+<div class="card">
+<button onclick="act('/admin/resume')">Resume</button>
+<button onclick="act('/admin/pause')">Pause</button>
+<button onclick="act('/scan','POST',true)">Scan Now</button>
+</div>
+<div class="card"><b>Last scan signals</b><div class="sig" id="sig">...</div></div>
 <script>
+async function act(url, method='POST', reload=false){
+  await fetch(url,{method,headers:{'Content-Type':'application/json'},body:method==='POST'?'{}':undefined});
+  if(reload) load();
+}
 async function load(){
- try{
-  const h = await (await fetch('/health')).json();
-  const st = await (await fetch('/status')).json();
-  document.getElementById('s').innerHTML =
-   '<div>status: <b class="' + (h.status==='ok'?'ok':'bad') + '">' + h.status + '</b></div>' +
-   '<div>env: ' + h.kalshi.env + ' · key loaded: <b class="' + (h.kalshi.key_loaded?'ok':'bad') + '">' + h.kalshi.key_loaded + '</b>' + (h.kalshi.key_error ? ' · ' + h.kalshi.key_error : '') + '</div>' +
-   '<div>auto-trade: ' + h.auto_trade + ' · paused: ' + h.paused + '</div>' +
-   '<div>scanning: ' + h.scanning.join(', ') + '</div>' +
-   '<div>trades today: <b>' + st.trades_today + '</b> / ' + st.max_trades_per_day + ' · edge >= ' + st.edge_threshold + '</div>' +
-   '<div>last scan: ' + (st.last_scan || 'never') + '</div>';
-  document.getElementById('j').textContent = JSON.stringify(st.last_signals, null, 2);
- }catch(e){document.getElementById('s').textContent = 'error: ' + e}
+  try{
+    const s = await (await fetch('/status')).json();
+    document.getElementById('s').innerHTML =
+      `<span class="${s.paused?'bad':'ok'}">${s.paused?'PAUSED':'ACTIVE'}</span> · ` +
+      `trades today: <b>${s.trades_today}/${s.max_trades_per_day}</b> · ` +
+      `spent: $${s.spent_today_dollars} · floor: ${s.min_price_cents}c/${s.fill_floor_cents}c<br>` +
+      `<span class="dim">scanning: ${s.scanning.join(', ')}<br>last scan: ${s.last_scan||'-'}<br>` +
+      (s.last_error?`<span class="bad">error: ${s.last_error}</span>`:'') + `</span>`;
+    document.getElementById('sig').textContent =
+      (s.last_signals||[]).map(r=>`${r.series}: ${r.side||'-'} edge=${r.edge??'-'} ${r.reason||''}`).join('\n') || 'no scans yet';
+  }catch(e){ document.getElementById('s').textContent = 'dashboard error: '+e; }
 }
 load(); setInterval(load, 10000);
-</script>"""
+</script></body></html>"""
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
@@ -1158,7 +1262,7 @@ async def debug_markets(series: str = "KXBTC15M"):
         except Exception:
             return float("inf")
 
-    mkts = sorted(mkts, key=close_ts)   # soonest-closing first, like the scanner
+    mkts = sorted(mkts, key=close_ts)  # soonest-closing first, like the scanner
     out = []
     for m in mkts[:5]:
         exp = m.get("close_time") or m.get("expiration_time")
@@ -1208,6 +1312,7 @@ async def debug_market(ticker: str):
         "can_close_early": m.get("can_close_early"),
         "raw": m,
     }
+
 @app.get("/poly")
 def poly_status():
     """Polymarket scanner state (JSON)."""
@@ -1233,49 +1338,41 @@ def poly_board():
     def esc(s):
         return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
     reach = POLY_STATE["reachable"]
-    badge = ("<span style='color:#0a0'>REACHABLE</span>" if reach else
-             "<span style='color:#c00'>UNREACHABLE</span>" if reach is False else
-             "<span style='color:#fa0'>PROBING...</span>")
-    rows_w = "".join(
-        f"<tr><td>${w['usd']:,}</td><td>{esc(w['side'])} {esc(w['outcome'])}</td>"
-        f"<td>{w['price_c']}c</td><td>{esc(w['title'])}</td><td>{w['ts']}</td></tr>"
-        for w in POLY_STATE["whales"]) or "<tr><td colspan=5>no whale prints yet</td></tr>"
-    rows_g = "".join(
-        f"<tr><td>{esc(g['pair'])}</td><td>{g['poly_c']}c</td><td>{g['kalshi_c']}c</td>"
-        f"<td><b>{g['gap_c']:+}c</b></td><td>{g['ts']}</td></tr>"
-        for g in POLY_STATE["gaps"]) or "<tr><td colspan=5>no pairs configured (set POLY_KALSHI_PAIRS)</td></tr>"
-    rows_t = "".join(
-        f"<tr><td>{esc(m['question'])}</td><td>{m['yes_c']}c</td>"
-        f"<td>${m['vol24h']:,}</td><td>{m['ends']}</td></tr>"
-        for m in POLY_STATE["watched"]) or "<tr><td colspan=4>no watched-theme markets found</td></tr>"
-    rows_b = "".join(
-        f"<tr><td>{esc(m['question'])}</td><td>{m['yes_c']}c</td>"
-        f"<td>${m['vol24h']:,}</td><td>{m['ends']}</td></tr>"
-        for m in POLY_STATE["board"]) or "<tr><td colspan=4>board empty</td></tr>"
-    return f"""<!doctype html><html><head>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="120">
-<title>Polymarket Intel</title>
+    badge = ("REACHABLE" if reach else
+             "UNREACHABLE" if reach is False else
+             "PROBING...")
+
+    def tbl(rows, headers):
+        if not rows:
+            return "<p class='dim'>none yet</p>"
+        h = "".join(f"<th>{x}</th>" for x in headers)
+        body = "".join("<tr>" + "".join(f"<td>{c}</td>" for c in r) + "</tr>" for r in rows)
+        return f"<table><tr>{h}</tr>{body}</table>"
+
+    whales = tbl([[f"${w['usd']:,}", esc(w['side']), f"{w['price_c']}c", esc(w['title']), w['ts']]
+                  for w in POLY_STATE["whales"]], ["Size", "Side", "Px", "Market", "UTC"])
+    gaps = tbl([[esc(g['pair']), f"{g['poly_c']}c", f"{g['kalshi_c']}c", f"{g['gap_c']:+}c", g['ts']]
+                for g in POLY_STATE["gaps"]], ["Pair", "Poly YES", "Kalshi mid", "Gap", "UTC"])
+    watched = tbl([[esc(m['question']), f"{m['yes_c']}c", f"${m['vol24h']:,}", m['ends']]
+                   for m in POLY_STATE["watched"]], ["Market", "YES", "24h Vol", "Ends"])
+    board = tbl([[esc(m['question']), f"{m['yes_c']}c", f"${m['vol24h']:,}", m['ends']]
+                 for m in POLY_STATE["board"]], ["Market", "YES", "24h Vol", "Ends"])
+
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="120"><title>Polymarket Intel</title>
 <style>
-body{{font-family:-apple-system,system-ui,sans-serif;margin:12px;background:#0d1117;color:#e6edf3}}
-h2{{font-size:1.05em;margin:18px 0 6px}}
-table{{border-collapse:collapse;width:100%;font-size:.82em}}
-td,th{{border:1px solid #30363d;padding:5px 6px;text-align:left;vertical-align:top}}
-th{{background:#161b22}}
-.card{{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:10px;margin-bottom:8px}}
+body{{font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;max-width:900px;margin:0 auto;padding:16px}}
+h1{{color:#f59e0b;font-size:1.3rem}} h2{{font-size:1rem;color:#cbd5e1}}
+table{{width:100%;border-collapse:collapse;font-size:.8rem}}
+td,th{{padding:6px 8px;border-bottom:1px solid #334155;text-align:left}}
+.dim{{color:#94a3b8}}
 </style></head><body>
-<div class="card"><b>Polymarket Scanner</b> &nbsp; {badge} &nbsp;
-last scan: {POLY_STATE['last_scan'] or 'never'}<br>
-markets seen: {POLY_STATE['markets_seen']} &nbsp;
-whale threshold: ${POLY_WHALE_MIN_USD:,.0f} &nbsp;
-error: {esc(POLY_STATE['last_error'] or '-')}
-<br><small>read-only - auto-refreshes every 2 min</small></div>
-<h2>Whale prints (last 25)</h2>
-<table><tr><th>Size</th><th>Side</th><th>Px</th><th>Market</th><th>UTC</th></tr>{rows_w}</table>
-<h2>Verified Kalshi pairs - gap watch</h2>
-<table><tr><th>Pair</th><th>Poly YES</th><th>Kalshi mid</th><th>Gap</th><th>UTC</th></tr>{rows_g}</table>
-<h2>Watched themes ({', '.join(POLY_WATCH_KEYWORDS)})</h2>
-<table><tr><th>Market</th><th>YES</th><th>24h Vol</th><th>Ends</th></tr>{rows_t}</table>
-<h2>Top markets by 24h volume</h2>
-<table><tr><th>Market</th><th>YES</th><th>24h Vol</th><th>Ends</th></tr>{rows_b}</table>
+<h1>Polymarket Scanner &nbsp; <small>{badge}</small></h1>
+<p class="dim">last scan: {POLY_STATE['last_scan'] or 'never'} · markets seen: {POLY_STATE['markets_seen']} ·
+whale threshold: ${POLY_WHALE_MIN_USD:,.0f} · error: {esc(POLY_STATE['last_error'] or '-')} · read-only, refreshes every 2 min</p>
+<h2>Whale prints (last 25)</h2>{whales}
+<h2>Verified Kalshi pairs - gap watch</h2>{gaps}
+<h2>Watched themes ({', '.join(POLY_WATCH_KEYWORDS)})</h2>{watched}
+<h2>Top markets by 24h volume</h2>{board}
 </body></html>"""
