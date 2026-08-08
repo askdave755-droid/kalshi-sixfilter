@@ -21,6 +21,22 @@ PATCHES vs previous build:
    kalshi_get's params arg. Embedding them in the URL broke the Kalshi request
    signature (401 Unauthorized on every lookup) which disabled the crash-fill
    dump guard. Confirmed in Railway logs Aug 7.
+7. Momentum module (Aug 9, 2026) - three parts, all tunable via env:
+   a) ALIGNMENT (MOM_K, MOM_ALIGN_MINUTES): when the trailing 15m move
+      exceeds MOM_K * sigma_15, refuse to trade INTO momentum late in the
+      window (no YES into a falling tape, no NO into a rising one, when
+      mins < MOM_ALIGN_MINUTES). Aug 8 PM session: falling-tape YES buys
+      went 35% WR / -$3.81.
+   b) OVERRIDE (MOM_OVERRIDE_P, MOM_OVERRIDE_EDGE, MOM_OVERRIDE_BAND,
+      MOM_OVERRIDE_MIN_MINUTES): when model + momentum agree strongly
+      (down tape + p <= 0.40, or up tape + p >= 0.60) with >= 5 min left,
+      the Consensus Gate's neutral band relaxes from mid>=50 / mid<50 to
+      mid 48-52, but the stricter MOM_OVERRIDE_EDGE floor applies inside
+      that band. Ships in prove-it mode: override fills are tagged
+      [MOM OVERRIDE] in Telegram and will be graded separately.
+   c) LOGGING: every order + evaluation now carries r15, mid, momentum,
+      and override flags so the next CSV backtest can grade the patch
+      itself instead of inferring regime from outcomes.
 """
 
 import os
@@ -116,6 +132,23 @@ FILL_FLOOR_CENTS = env_float("FILL_FLOOR_CENTS", default=55.0)
 # entry, sell it back before settlement and lock the gain. 0 = disabled.
 TAKE_PROFIT_CENTS = env_float("TAKE_PROFIT_CENTS", default=0.0)
 AUTO_TRADE = env("AUTO_TRADE", default="true").lower() == "true"
+
+# PATCH 7 — Momentum module (built on the 7-day, 13k-window backtest):
+# after big 15m moves, continuation runs 80-96% with 4-8min left (mean
+# reversion is a myth at this horizon). Two mechanisms:
+# 7a) ALIGNMENT BLOCK: late in the window, refuse to trade INTO momentum
+#     (no YES while tape is falling, no NO while it's rising). This kills
+#     the boundary "knife-catch" trades that went 35% WR on Aug 8 PM.
+# 7b) MOMENTUM OVERRIDE: when model + momentum agree strongly, relax the
+#     consensus gate's neutral band (mid 48-52) so the bot can actually
+#     take the NO side as momentum shifts - but demand a bigger edge
+#     (MOM_OVERRIDE_EDGE) as the safety payment for overriding the gate.
+MOM_K = env_float("MOM_K", default=0.5)               # threshold = K * sigma_15m
+MOM_ALIGN_MINUTES = env_float("MOM_ALIGN_MINUTES", default=10.0)  # block zone: mins < this
+MOM_OVERRIDE_P = env_float("MOM_OVERRIDE_P", default=0.40)        # model must be <= this (NO) / >= 1-this (YES)
+MOM_OVERRIDE_EDGE = env_float("MOM_OVERRIDE_EDGE", default=0.12)  # stricter edge inside neutral band
+MOM_OVERRIDE_BAND = env_float("MOM_OVERRIDE_BAND", default=2.0)   # cents of neutral band past 50
+MOM_OVERRIDE_MIN_MINUTES = env_float("MOM_OVERRIDE_MIN_MINUTES", default=5.0)
 
 TELEGRAM_BOT_TOKEN = env("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = env("TELEGRAM_CHAT_ID")
@@ -414,12 +447,29 @@ async def analyze_series(series: str, execute: bool = False):
         result["reason"] = "model has no directional edge (near 50/50)"
         return result
 
+    # ---------------------------------------------------- PATCH 7: momentum --
+    mid = (yes_bid + yes_ask) / 2.0
+    sigma_15 = sigma * math.sqrt(15.0)
+    mom_thr = MOM_K * sigma_15
+    mom_down = r15 <= -mom_thr
+    mom_up = r15 >= mom_thr
+    momentum = "down" if mom_down else ("up" if mom_up else "flat")
+
+    # 7a) alignment: late in the window, refuse to trade INTO momentum
+    yes_align_ok = not (mom_down and mins < MOM_ALIGN_MINUTES)
+    no_align_ok = not (mom_up and mins < MOM_ALIGN_MINUTES)
+
+    # 7b) override: model + momentum agree strongly -> relax gate neutral band
+    no_override = mom_down and p <= MOM_OVERRIDE_P and mins >= MOM_OVERRIDE_MIN_MINUTES
+    yes_override = mom_up and p >= (1.0 - MOM_OVERRIDE_P) and mins >= MOM_OVERRIDE_MIN_MINUTES
+
+    mid_yes_ok = mid >= (50.0 - MOM_OVERRIDE_BAND if yes_override else 50.0)
+    mid_no_ok = mid < (50.0 + MOM_OVERRIDE_BAND if no_override else 50.0)
+
     # Filter 5 — edge vs market, WITH the Consensus Gate AND the EV floor.
     # Consensus Gate: never fight the market's directional lean
     # (disagreement trades went ~0-13, agreement trades 6-1).
     # PATCH 2 (EV floor): edge must clear EDGE_THRESHOLD + taker fee.
-    # A "8c edge" at a 58c entry is really ~6.3c after Kalshi's fee formula.
-    mid = (yes_bid + yes_ask) / 2.0
     edge_yes = p - yes_ask / 100.0
     edge_no = (yes_bid / 100.0) - p
 
@@ -427,22 +477,33 @@ async def analyze_series(series: str, execute: bool = False):
     fee_no_c = kalshi_taker_fee_cents(100.0 - yes_bid, TRADE_SIZE) / max(TRADE_SIZE, 1)
     floor_yes = EDGE_THRESHOLD + fee_yes_c / 100.0
     floor_no = EDGE_THRESHOLD + fee_no_c / 100.0
+    # inside the override's neutral band, demand the stricter edge
+    if yes_override and mid < 50.0:
+        floor_yes = max(floor_yes, MOM_OVERRIDE_EDGE)
+    if no_override and mid >= 50.0:
+        floor_no = max(floor_no, MOM_OVERRIDE_EDGE)
 
-    if edge_yes >= edge_no and edge_yes >= floor_yes and mid >= 50:
+    if edge_yes >= edge_no and edge_yes >= floor_yes and mid_yes_ok and yes_align_ok:
         side, price_c, edge = "yes", yes_ask, edge_yes
-    elif edge_no > edge_yes and edge_no >= floor_no and mid < 50:
+    elif edge_no > edge_yes and edge_no >= floor_no and mid_no_ok and no_align_ok:
         side, price_c, edge = "no", 100.0 - yes_bid, edge_no
     else:
         side, price_c, edge = None, None, max(edge_yes, edge_no)
     f["edge"] = side is not None
+    used_override = (side == "yes" and mid < 50.0) or (side == "no" and mid >= 50.0)
     result.update(edge=round(edge, 4), side=side, limit_price_cents=price_c,
-                  ev_floor=round(min(floor_yes, floor_no), 4))
+                  ev_floor=round(min(floor_yes, floor_no), 4),
+                  r15=round(r15, 5), mid=round(mid, 1), momentum=momentum,
+                  override=used_override)
     if not f["edge"]:
-        leaning = "up" if mid >= 50 else "down"
         would = "yes" if edge_yes >= edge_no else "no"
         raw_floor = floor_yes if would == "yes" else floor_no
-        if (would == "yes") != (mid >= 50) and max(edge_yes, edge_no) >= raw_floor:
-            result["reason"] = f"edge {round(edge, 3)} but AGAINST market lean ({leaning}) - consensus gate"
+        if would == "yes" and not yes_align_ok:
+            result["reason"] = f"momentum block: tape falling (r15 {round(r15*100,2)}%), no YES late in window"
+        elif would == "no" and not no_align_ok:
+            result["reason"] = f"momentum block: tape rising (r15 {round(r15*100,2)}%), no NO late in window"
+        elif (would == "yes" and not mid_yes_ok) or (would == "no" and not mid_no_ok):
+            result["reason"] = f"edge {round(edge, 3)} but against market lean and no momentum override"
         elif max(edge_yes, edge_no) >= EDGE_THRESHOLD:
             result["reason"] = f"edge {round(edge, 3)} dies to fees (EV floor {round(raw_floor, 3)})"
         else:
@@ -496,9 +557,15 @@ async def analyze_series(series: str, execute: bool = False):
                 tag = "FILLED" if filled_n >= TRADE_SIZE else f"PARTIAL {filled_n:g}/{TRADE_SIZE}"
             else:
                 tag = "NOT FILLED (book moved - no cost, not counted)"
+            ov_tag = ""
+            if side == "no" and no_override and mid >= 50.0:
+                ov_tag = " [MOM OVERRIDE]"
+            elif side == "yes" and yes_override and mid < 50.0:
+                ov_tag = " [MOM OVERRIDE]"
             await tg_send(
-                f"ORDER {tag}\n{ticker}\nbuy {side.upper()} x{TRADE_SIZE} @ {round(price_c, 1)}c\n"
-                f"model {round(p, 3)} - edge {round(edge, 3)} - expires in {round(mins, 1)}m"
+                f"ORDER {tag}{ov_tag}\n{ticker}\nbuy {side.upper()} x{TRADE_SIZE} @ {round(price_c, 1)}c\n"
+                f"model {round(p, 3)} - edge {round(edge, 3)} - expires in {round(mins, 1)}m\n"
+                f"r15 {round(r15 * 100, 2)}% - mid {round(mid, 1)}c - momentum {momentum}"
             )
             if filled_n > 0:
                 # GUARD 2 - crash-fill dump (PATCH 3: hardened lookup).
