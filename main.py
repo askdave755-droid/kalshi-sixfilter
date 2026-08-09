@@ -177,6 +177,94 @@ for _pair in env("POLY_KALSHI_PAIRS", default="").split(","):
 POLY_GAMMA = "https://gamma-api.polymarket.com"
 POLY_DATA = "https://data-api.polymarket.com"
 
+# ------------------------------------------------- econ base-rate scanner ----
+# PAPER-ONLY. Discovers Kalshi econ markets (FOMC / CPI / jobless claims),
+# prices them against historical base rates, logs a paper trade whenever the
+# market diverges, and grades it at settlement. Places NO orders - the v1
+# crypto engine was falsified at n=254 (61.4% vs 63.1% breakeven); any v2
+# earns order code only after a paper sample proves edge. Same falsification
+# gates: measure first, size never until proven.
+ECON_ENABLED = env("ECON_ENABLED", default="true").lower() in ("1", "true", "yes")
+ECON_SCAN_SEC = env_int("ECON_SCAN_SEC", default=3600)
+ECON_GAP_ALERT = env_float("ECON_GAP_ALERT", default=0.10)   # 10 pts divergence
+ECON_KEYWORDS = [w.strip().lower() for w in env(
+    "ECON_KEYWORDS", default="fed,fomc,cpi,inflation,jobless,claims,payroll,employment situation"
+).split(",") if w.strip()]
+ECON_MAX_SERIES = env_int("ECON_MAX_SERIES", default=8)
+
+# Historical base rates (approximate, 2021-2026, v1 - refine as the paper log
+# teaches us; these are the numbers the THESIS says retail underweights).
+BASE_FOMC = {      # outcome of a scheduled meeting
+    "hold": 0.65, "cut25": 0.20, "hike25": 0.12, "cut50": 0.02, "hike50": 0.01,
+}
+BASE_CLAIMS = [    # (upper_bound_K, probability) weekly initial claims, SA
+    (200, 0.03), (215, 0.10), (230, 0.25), (245, 0.28),
+    (260, 0.18), (275, 0.10), (300, 0.04), (10**9, 0.02),
+]
+BASE_CPI = [       # (upper_bound_m/m_pct, probability) CPI all-items SA
+    (0.0, 0.08), (0.1, 0.10), (0.2, 0.18), (0.3, 0.24),
+    (0.4, 0.18), (0.5, 0.12), (0.6, 0.06), (10**9, 0.04),
+]
+
+# FRED (Federal Reserve Economic Data) - free official API. When FRED_API_KEY
+# is set, the static tables above are REPLACED at startup (and daily) with
+# base rates computed from real history: ICSA weekly claims + CPIAUCSL m/m.
+# FOMC outcomes are decisions, not a series - those stay static for now.
+FRED_API_KEY = env("FRED_API_KEY")
+FRED_BASE = "https://api.stlouisfed.org/fred/series/observations"
+
+async def fred_series(series_id: str, limit: int):
+    """Newest `limit` observations of a FRED series as floats (oldest first)."""
+    async with httpx.AsyncClient(timeout=20) as c:
+        r = await c.get(FRED_BASE, params={
+            "series_id": series_id, "api_key": FRED_API_KEY,
+            "file_type": "json", "sort_order": "desc", "limit": limit})
+        r.raise_for_status()
+        obs = r.json().get("observations", [])
+    vals = []
+    for o in reversed(obs):
+        try:
+            vals.append(float(o["value"]))
+        except (KeyError, ValueError):
+            pass          # FRED uses "." for missing
+    return vals
+
+def _compute_brackets(vals, bounds):
+    """Share of observations falling in each (prev, ub] bracket."""
+    n = len(vals)
+    if n < 20:
+        return None
+    out, prev = [], 0.0
+    for ub in bounds:
+        cnt = sum(1 for v in vals if prev <= v < ub)
+        out.append((ub, round(cnt / n, 4)))
+        prev = ub
+    return out
+
+async def refresh_base_rates():
+    """Recompute BASE_CLAIMS / BASE_CPI from FRED history. On any failure the
+    static defaults stay in place - never block the scanner on the Fed."""
+    global BASE_CLAIMS, BASE_CPI
+    if not FRED_API_KEY:
+        log.info("FRED_API_KEY not set - using static base-rate tables")
+        return
+    try:
+        claims = [v / 1000.0 for v in await fred_series("ICSA", 260)]   # ~5y weekly, -> thousands
+        b = _compute_brackets(claims, [ub for ub, _ in BASE_CLAIMS])
+        if b:
+            BASE_CLAIMS = b
+        cpi_idx = await fred_series("CPIAUCSL", 61)                      # ~5y monthly index
+        cpi_mm = [100.0 * (cpi_idx[i] / cpi_idx[i - 1] - 1.0)
+                  for i in range(1, len(cpi_idx))]
+        b2 = _compute_brackets(cpi_mm, [ub for ub, _ in BASE_CPI])
+        if b2:
+            BASE_CPI = b2
+        ECON_STATE["fred"] = f"claims n={len(claims)}, cpi n={len(cpi_mm)}"
+        log.info(f"econ base rates loaded from FRED ({ECON_STATE['fred']})")
+    except Exception as e:
+        log.error(f"FRED refresh failed, keeping static tables: {e}")
+        ECON_STATE["fred"] = f"error: {e}"
+
 # ------------------------------------------------------------- kalshi auth --
 _PRIVATE_KEY = None
 _KEY_ERROR = None
@@ -943,6 +1031,176 @@ async def poly_loop():
             log.error(f"poly scan error: {e}")
         await asyncio.sleep(POLY_SCAN_SEC)
 
+# --------------------------------------------- econ base-rate engine --------
+ECON_STATE = {
+    "last_scan": None, "last_error": None,
+    "series_found": [], "markets": [],          # latest inventory snapshot
+    "signals": [], "settled": [],               # paper ledger
+    "seen": set(), "alerted": {},
+    "unparsed": 0, "fred": None,
+    "fred_last_refresh": 0.0,
+}
+
+def _bracket_prob(table, x):
+    """Probability that the value falls in the bracket containing x."""
+    prev = 0.0
+    for ub, p in table:
+        if x < ub:
+            return p
+        prev = ub
+    return table[-1][1]
+
+def econ_base_rate(series_title: str, m: dict):
+    """Return (base_prob_yes, label) or (None, reason). Defensive v1 parsing -
+    anything unrecognized is logged as unparsed so we fix regexes off REAL
+    market titles rather than guessing."""
+    t = " ".join(str(m.get(k) or "") for k in
+                 ("title", "subtitle", "yes_sub_title", "no_sub_title")).lower()
+    st = (series_title or "").lower()
+    try:
+        if any(k in st for k in ("fed", "fomc", "interest rate")):
+            if any(k in t for k in ("unchanged", "no change", "keep", "maintain", "hold")):
+                return BASE_FOMC["hold"], "fomc:hold"
+            if any(k in t for k in ("cut", "decrease", "lower")):
+                return (BASE_FOMC["cut50"] if "50" in t else BASE_FOMC["cut25"]), "fomc:cut"
+            if any(k in t for k in ("raise", "hike", "increase")):
+                return (BASE_FOMC["hike50"] if "50" in t else BASE_FOMC["hike25"]), "fomc:hike"
+            return None, "fomc:unparsed"
+        if any(k in st for k in ("claim", "jobless", "unemployment insurance")):
+            nums = re.findall(r"(\d{3}),?(\d{3})", t)
+            flat = [int(a + b) / 1000.0 for a, b in nums]
+            flat += [int(x) for x in re.findall(r"(\d{3})\s?k", t)]
+            if not flat:
+                return None, "claims:unparsed"
+            x = sum(flat) / len(flat)
+            return _bracket_prob(BASE_CLAIMS, x), f"claims:~{x:.0f}K"
+        if "cpi" in st or "inflation" in st:
+            nums = re.findall(r"(-?\d+\.\d)\s?%", t)
+            if not nums:
+                return None, "cpi:unparsed"
+            x = sum(float(v) for v in nums) / len(nums)
+            return _bracket_prob(BASE_CPI, x), f"cpi:~{x}%"
+        return None, "family:unknown"
+    except Exception:
+        return None, "parse:error"
+
+async def econ_scan_once():
+    # 1) discover econ series (cached per process; refreshed each restart)
+    if not ECON_STATE["series_found"]:
+        found, cursor = [], ""
+        for _ in range(5):
+            params = {"limit": 200}
+            if cursor:
+                params["cursor"] = cursor
+            data = await kalshi_get("/series", params=params)
+            for sr in data.get("series", []):
+                title = f"{sr.get('ticker','')} {sr.get('title','')}".lower()
+                if any(k in title for k in ECON_KEYWORDS):
+                    found.append({"ticker": sr.get("ticker"), "title": sr.get("title")})
+            cursor = data.get("cursor") or ""
+            if not cursor:
+                break
+        ECON_STATE["series_found"] = found[:ECON_MAX_SERIES]
+        log.info(f"econ series discovered: {[s['ticker'] for s in ECON_STATE['series_found']]}")
+
+    # 2) scan open markets in those series
+    markets_out = []
+    for sr in ECON_STATE["series_found"]:
+        try:
+            data = await kalshi_get("/markets", params={
+                "series_ticker": sr["ticker"], "status": "open", "limit": 40})
+        except Exception as e:
+            log.warning(f"econ markets {sr['ticker']}: {e}")
+            continue
+        for m in data.get("markets", []):
+            bid, ask = cents(m, "yes_bid"), cents(m, "yes_ask")
+            if bid is None or ask is None:
+                continue
+            mid = (bid + ask) / 2.0
+            base, label = econ_base_rate(sr.get("title", ""), m)
+            if base is None:
+                ECON_STATE["unparsed"] += 1
+            row = {"ticker": m.get("ticker"), "title": (m.get("title") or "")[:100],
+                   "mid_c": round(mid, 1), "base": round(base * 100, 1) if base else None,
+                   "label": label, "expires": str(m.get("expiration_time") or "")[:10]}
+            markets_out.append(row)
+
+            # 3) divergence -> paper signal + alert
+            if base is None:
+                continue
+            gap = base - mid / 100.0
+            tick = m.get("ticker")
+            if abs(gap) >= ECON_GAP_ALERT and tick not in ECON_STATE["seen"]:
+                ECON_STATE["seen"].add(tick)
+                side = "YES" if gap > 0 else "NO"
+                price_c = mid if side == "YES" else 100.0 - mid
+                sig = {"ticker": tick, "title": row["title"], "side": side,
+                       "entry_c": round(price_c, 1), "base_pct": round(base * 100, 1),
+                       "gap_pts": round(abs(gap) * 100, 1),
+                       "ts": datetime.now(timezone.utc).strftime("%m-%d %H:%M"),
+                       "settled": False}
+                ECON_STATE["signals"].insert(0, sig)
+                await tg_send(
+                    f"ECON PAPER SIGNAL (no money)\n{row['title'][:80]}\n"
+                    f"base rate {base*100:.0f}% vs market {mid:.1f}c -> gap {abs(gap)*100:.0f} pts\n"
+                    f"paper BUY {side} @ {price_c:.1f}c | grading at settlement")
+    ECON_STATE["markets"] = markets_out[:60]
+
+    # 4) grade paper signals whose markets have settled
+    for sig in ECON_STATE["signals"]:
+        if sig["settled"]:
+            continue
+        try:
+            data = await kalshi_get(f"/markets/{sig['ticker']}")
+            m = data.get("market", {})
+            result = str(m.get("result") or "").lower()
+            if result not in ("yes", "no"):
+                continue
+            won = ((sig["side"] == "YES") == (result == "yes"))
+            pnl_c = (100.0 - sig["entry_c"]) if won else -sig["entry_c"]
+            sig["settled"] = True
+            sig["result"] = result; sig["won"] = won; sig["pnl_c"] = round(pnl_c, 1)
+            ECON_STATE["settled"].insert(0, dict(sig))
+            n = len(ECON_STATE["settled"])
+            w = sum(1 for x in ECON_STATE["settled"] if x["won"])
+            tot = sum(x["pnl_c"] for x in ECON_STATE["settled"])
+            await tg_send(
+                f"ECON PAPER RESULT: {'WIN' if won else 'LOSS'} ({pnl_c:+.0f}c)\n"
+                f"{sig['title'][:70]}\n"
+                f"paper record: {w}W-{n-w}L, {tot:+.0f}c total")
+        except Exception as e:
+            log.warning(f"econ grade {sig['ticker']}: {e}")
+    ECON_STATE["last_scan"] = datetime.now(timezone.utc).isoformat()
+
+async def econ_loop():
+    await asyncio.sleep(25)
+    if not ECON_ENABLED:
+        log.info("econ scanner disabled (ECON_ENABLED=false)")
+        return
+    try:
+        await kalshi_get("/exchange/status")
+        await refresh_base_rates()
+        src = f"base rates: FRED live ({ECON_STATE.get('fred')})" if ECON_STATE.get("fred", "").startswith("claims") \
+              else "base rates: static tables (no FRED key)"
+        log.info("econ base-rate scanner online (paper-only)")
+        await tg_send("Econ base-rate scanner online (PAPER ONLY - no orders, no money).\n"
+                      "Watching FOMC/CPI/claims markets for retail-vs-base-rate gaps.\n"
+                      f"{src}\nBoard: /econ/board")
+    except Exception as e:
+        ECON_STATE["last_error"] = str(e)
+        log.error(f"econ scanner probe failed: {e}")
+        return
+    while True:
+        try:
+            if time.time() - ECON_STATE["fred_last_refresh"] > 86400:
+                ECON_STATE["fred_last_refresh"] = time.time()
+                await refresh_base_rates()
+            await econ_scan_once()
+        except Exception as e:
+            ECON_STATE["last_error"] = str(e)
+            log.error(f"econ scan error: {e}")
+        await asyncio.sleep(ECON_SCAN_SEC)
+
 # -------------------------------------------------------------------- app ---
 app = FastAPI(title="SixFilter Kalshi Trader API", docs_url="/docs")
 
@@ -951,6 +1209,7 @@ async def _startup():
     load_key()
     asyncio.create_task(auto_loop())
     asyncio.create_task(poly_loop())
+    asyncio.create_task(econ_loop())
 
 # ------------------------------------------- offline model calibration test ---
 async def _fetch_klines(symbol: str, days: int):
@@ -1459,4 +1718,74 @@ whale threshold: ${POLY_WHALE_MIN_USD:,.0f} · error: {esc(POLY_STATE['last_erro
 <h2>Verified Kalshi pairs - gap watch</h2>{gaps}
 <h2>Watched themes ({', '.join(POLY_WATCH_KEYWORDS)})</h2>{watched}
 <h2>Top markets by 24h volume</h2>{board}
+</body></html>"""
+
+
+@app.get("/econ")
+def econ_status():
+    """Econ base-rate paper scanner state (JSON)."""
+    n = len(ECON_STATE["settled"])
+    w = sum(1 for x in ECON_STATE["settled"] if x["won"])
+    tot = sum(x["pnl_c"] for x in ECON_STATE["settled"])
+    return {
+        "enabled": ECON_ENABLED,
+        "last_scan": ECON_STATE["last_scan"],
+        "last_error": ECON_STATE["last_error"],
+        "series_found": ECON_STATE["series_found"],
+        "unparsed_count": ECON_STATE["unparsed"],
+        "fred": ECON_STATE["fred"],
+        "base_claims": BASE_CLAIMS, "base_cpi": BASE_CPI, "base_fomc": BASE_FOMC,
+        "paper_record": {"settled": n, "wins": w, "win_rate": round(w / n, 3) if n else None,
+                         "total_pnl_c": round(tot, 1)},
+        "open_signals": [x for x in ECON_STATE["signals"] if not x["settled"]][:25],
+        "settled": ECON_STATE["settled"][:25],
+        "markets": ECON_STATE["markets"],
+    }
+
+@app.get("/econ/board", response_class=HTMLResponse)
+def econ_board():
+    """Mobile-friendly econ paper-trading page."""
+    def esc(s):
+        return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+    n = len(ECON_STATE["settled"])
+    w = sum(1 for x in ECON_STATE["settled"] if x["won"])
+    tot = sum(x["pnl_c"] for x in ECON_STATE["settled"])
+    open_sigs = [x for x in ECON_STATE["signals"] if not x["settled"]]
+    rows_o = "".join(
+        f"<tr><td>{esc(x['title'])}</td><td>{x['side']} @ {x['entry_c']}c</td>"
+        f"<td>{x['base_pct']}%</td><td>{x['gap_pts']}pts</td><td>{x['ts']}</td></tr>"
+        for x in open_sigs) or "<tr><td colspan=5>no open paper signals</td></tr>"
+    rows_s = "".join(
+        f"<tr><td>{esc(x['title'])}</td><td>{x['side']} @ {x['entry_c']}c</td>"
+        f"<td>{'WIN' if x['won'] else 'LOSS'}</td><td>{x['pnl_c']:+}c</td><td>{x['ts']}</td></tr>"
+        for x in ECON_STATE["settled"]) or "<tr><td colspan=5>nothing settled yet</td></tr>"
+    rows_m = "".join(
+        f"<tr><td>{esc(m['title'])}</td><td>{m['mid_c']}c</td>"
+        f"<td>{m['base'] if m['base'] is not None else 'n/a'}%</td><td>{m['expires']}</td></tr>"
+        for m in ECON_STATE["markets"]) or "<tr><td colspan=4>no econ markets found</td></tr>"
+    return f"""<!doctype html><html><head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="300">
+<title>Econ Paper Scanner</title>
+<style>
+body{{font-family:-apple-system,system-ui,sans-serif;margin:12px;background:#0d1117;color:#e6edf3}}
+h2{{font-size:1.05em;margin:18px 0 6px}}
+table{{border-collapse:collapse;width:100%;font-size:.82em}}
+td,th{{border:1px solid #30363d;padding:5px 6px;text-align:left;vertical-align:top}}
+th{{background:#161b22}}
+.card{{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:10px;margin-bottom:8px}}
+</style></head><body>
+<div class="card"><b>Econ Base-Rate Scanner</b> &nbsp; PAPER ONLY - no orders, no money<br>
+last scan: {ECON_STATE['last_scan'] or 'never'} &nbsp;
+series: {len(ECON_STATE['series_found'])} &nbsp;
+unparsed: {ECON_STATE['unparsed']} &nbsp;
+error: {esc(ECON_STATE['last_error'] or '-')}<br>
+<b>paper record: {w}W-{n-w}L ({round(100*w/n,1) if n else 0}%), {tot:+.0f}c</b>
+<br><small>auto-refreshes every 5 min</small></div>
+<h2>Open paper signals</h2>
+<table><tr><th>Market</th><th>Paper trade</th><th>Base rate</th><th>Gap</th><th>UTC</th></tr>{rows_o}</table>
+<h2>Settled paper trades (last 25)</h2>
+<table><tr><th>Market</th><th>Paper trade</th><th>Result</th><th>P&L</th><th>UTC</th></tr>{rows_s}</table>
+<h2>Econ market inventory</h2>
+<table><tr><th>Market</th><th>Mid</th><th>Base rate</th><th>Expires</th></tr>{rows_m}</table>
 </body></html>"""
