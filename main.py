@@ -45,6 +45,11 @@ PATCHES vs previous build:
    stops getting labeled up/down. Crash-fill guard now blacklists the
    ticker for the day (no re-buying the knife). /status self-reports
    max_price_cents + full momentum config.
+7c. Startup rehydration (Aug 9): boot pulls today's fills from the ledger
+   and rebuilds trades_today / spent_today_cents / traded_tickers, so a
+   redeploy can no longer reset the daily trade + spend caps (observed:
+   25/25 filled, redeploy, fresh 25-trade budget). Loud Telegram alert on
+   rehydrate success or failure.
 """
 
 import os
@@ -891,8 +896,51 @@ async def scan_all(execute: bool = False):
     STATE["last_signals"] = out
     return out
 
+
+async def rehydrate_state():
+    """PATCH 7c: rebuild today's counters from the ledger at boot.
+    Before this, every redeploy reset trades_today / spent_today_cents /
+    traded_tickers to zero - the 25-trade daily cap and spend cap silently
+    doubled on patch days (observed Aug 9: 25/25 filled, redeploy, fresh 25)."""
+    try:
+        day_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        data = await kalshi_get("/portfolio/fills", params={"limit": 200})
+        trades, spent, tickers = 0, 0.0, []
+        for f in data.get("fills", []):
+            ts = f.get("created_time") or f.get("ts")
+            try:
+                fdt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+            except Exception:
+                continue
+            if fdt < day_start:
+                continue                      # only today's ledger
+            if (f.get("action") or "").lower() != "buy":
+                continue                      # entries only; exits don't consume caps
+            side = (f.get("side") or "yes").lower()
+            px = f.get("yes_price") if side == "yes" else f.get("no_price")
+            cnt = float(f.get("count") or 0)
+            trades += 1
+            spent += float(px or 0) * cnt
+            tk = f.get("ticker")
+            if tk and tk not in tickers:
+                tickers.append(tk)
+        STATE["trades_today"] = trades
+        STATE["spent_today_cents"] = spent
+        STATE["traded_tickers"] = tickers
+        log.info(f"rehydrated: {trades} trades, {round(spent,1)}c spent, {len(tickers)} tickers today")
+        await tg_send(
+            f"STATE REHYDRATED\ntoday so far: {trades}/{MAX_TRADES_PER_DAY} trades, "
+            f"${round(spent/100.0, 2)} spent.\nCaps survive restarts now.")
+    except Exception as e:
+        log.error(f"rehydrate failed: {e}")
+        STATE["last_error"] = f"rehydrate: {e}"
+        await tg_send(
+            f"REHYDRATE FAILED\n{e}\nDaily counters are zeroed - the bot has a "
+            f"fresh {MAX_TRADES_PER_DAY}-trade budget it should not have. Watch it.")
+
 async def auto_loop():
     await asyncio.sleep(10)
+    await rehydrate_state()
     log.info(f"scanner up: {SCAN_SERIES} every {SCAN_INTERVAL_SEC}s - auto_trade={AUTO_TRADE}")
     await tg_send(f"SixFilter online.\nScanning: {', '.join(SCAN_SERIES)}\nAuto-trade: {AUTO_TRADE}")
     while True:
