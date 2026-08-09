@@ -37,6 +37,14 @@ PATCHES vs previous build:
    c) LOGGING: every order + evaluation now carries r15, mid, momentum,
       and override flags so the next CSV backtest can grade the patch
       itself instead of inferring regime from outcomes.
+7b. Momentum v2 (Aug 9, falsified overnight at n=50): override is now
+   momentum-LED (tape sets direction, model only must not disagree at
+   p<0.55) instead of model-led (p<=0.40 never fired). New 45m session
+   trend blocks YES/NO into grinds at ANY minute in the window. Momentum
+   threshold has an absolute floor (MOM_FLOOR_PCT) so dead-vol noise
+   stops getting labeled up/down. Crash-fill guard now blacklists the
+   ticker for the day (no re-buying the knife). /status self-reports
+   max_price_cents + full momentum config.
 """
 
 import os
@@ -149,6 +157,16 @@ MOM_OVERRIDE_P = env_float("MOM_OVERRIDE_P", default=0.40)        # model must b
 MOM_OVERRIDE_EDGE = env_float("MOM_OVERRIDE_EDGE", default=0.12)  # stricter edge inside neutral band
 MOM_OVERRIDE_BAND = env_float("MOM_OVERRIDE_BAND", default=2.0)   # cents of neutral band past 50
 MOM_OVERRIDE_MIN_MINUTES = env_float("MOM_OVERRIDE_MIN_MINUTES", default=5.0)
+
+# PATCH 7b (Aug 9, 2026) - momentum module v2. Falsified overnight at n=50:
+# the model stayed p=0.75-0.99 while the tape bled, so the p<=0.40 override
+# was unreachable; grind-downs of -0.01..-0.06% per window slipped under the
+# 15m threshold; entries at 10-14m sailed past the alignment window; and the
+# crash-fill guard's ticker got re-bought. Fixes below, all env-tunable.
+MOM_FLOOR_PCT = env_float("MOM_FLOOR_PCT", default=0.0003)      # min threshold: kills noise labels in dead vol
+MOM_SESSION_MINUTES = env_float("MOM_SESSION_MINUTES", default=45.0)  # session-trend lookback
+MOM_SESSION_K = env_float("MOM_SESSION_K", default=0.5)         # session threshold = K * sigma_session
+MOM_OVERRIDE_PMAX = env_float("MOM_OVERRIDE_PMAX", default=0.55)  # model only must NOT disagree (was <=0.40)
 
 TELEGRAM_BOT_TOKEN = env("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = env("TELEGRAM_CHAT_ID")
@@ -347,8 +365,10 @@ def recalibrate(p: float, mins_left: float, r15: float, sigma_1m: float, symbol:
     return min(max(p, 0.01), 0.99)
 
 async def binance_stats(symbol: str):
-    """Return (spot, sigma_per_minute, dampened_drift_per_minute, r15).
-    r15 = log return over the trailing 15 minutes, used by recalibrate()."""
+    """Return (spot, sigma_per_minute, dampened_drift_per_minute, r15, r45).
+    r15 = trailing 15m log return (recalibrate + momentum); r45 = trailing
+    45m log return (PATCH 7b session trend - catches slow grind-downs that
+    never trip the 15m threshold)."""
     async with httpx.AsyncClient(timeout=10) as c:
         r = await c.get(
             "https://api.binance.com/api/v3/klines",
@@ -361,7 +381,8 @@ async def binance_stats(symbol: str):
     # Momentum barely persists at 15-min scale; keep only a whisper of tilt.
     drift = (statistics.mean(rets[-20:]) * 0.15) if len(rets) >= 20 else 0.0
     r15 = math.log(closes[-1] / closes[-15]) if len(closes) >= 16 else 0.0
-    return closes[-1], sigma, drift, r15
+    r45 = math.log(closes[-1] / closes[-45]) if len(closes) >= 46 else r15
+    return closes[-1], sigma, drift, r15, r45
 
 def prob_above(spot: float, strike: float, sigma_1m: float, drift_1m: float, minutes: float) -> float:
     if minutes <= 0:
@@ -379,6 +400,7 @@ STATE = {
     "trades_today": 0,
     "spent_today_cents": 0.0,
     "traded_tickers": [],
+    "guard_blacklist": [],   # PATCH 7b: tickers dump-guarded off; no re-entry til next day
     "open_positions": [],
     "attempt_cooldown": {},
     "last_scan": None,
@@ -394,6 +416,7 @@ def reset_daily():
         STATE["trades_today"] = 0
         STATE["spent_today_cents"] = 0.0
         STATE["traded_tickers"] = []
+        STATE["guard_blacklist"] = []
         STATE["attempt_cooldown"] = {}
 
 # ---------------------------------------------------------------- telegram --
@@ -512,7 +535,7 @@ async def analyze_series(series: str, execute: bool = False):
 
     # Filter 3 — live price feed
     try:
-        spot, sigma, drift, r15 = await binance_stats(symbol)
+        spot, sigma, drift, r15, r45 = await binance_stats(symbol)
         f["data_fresh"] = True
     except Exception as e:
         f["data_fresh"] = False
@@ -538,18 +561,29 @@ async def analyze_series(series: str, execute: bool = False):
     # ---------------------------------------------------- PATCH 7: momentum --
     mid = (yes_bid + yes_ask) / 2.0
     sigma_15 = sigma * math.sqrt(15.0)
-    mom_thr = MOM_K * sigma_15
+    mom_thr = max(MOM_K * sigma_15, MOM_FLOOR_PCT)
     mom_down = r15 <= -mom_thr
     mom_up = r15 >= mom_thr
     momentum = "down" if mom_down else ("up" if mom_up else "flat")
 
-    # 7a) alignment: late in the window, refuse to trade INTO momentum
-    yes_align_ok = not (mom_down and mins < MOM_ALIGN_MINUTES)
-    no_align_ok = not (mom_up and mins < MOM_ALIGN_MINUTES)
+    # 7b-i) session trend: a slow grind is invisible at 15m scale but obvious
+    # over MOM_SESSION_MINUTES. This is what bled the account overnight Aug 9.
+    sigma_sess = sigma * math.sqrt(MOM_SESSION_MINUTES)
+    sess_thr = max(MOM_SESSION_K * sigma_sess, MOM_FLOOR_PCT)
+    sess_down = r45 <= -sess_thr
+    sess_up = r45 >= sess_thr
+    session = "down" if sess_down else ("up" if sess_up else "flat")
 
-    # 7b) override: model + momentum agree strongly -> relax gate neutral band
-    no_override = mom_down and p <= MOM_OVERRIDE_P and mins >= MOM_OVERRIDE_MIN_MINUTES
-    yes_override = mom_up and p >= (1.0 - MOM_OVERRIDE_P) and mins >= MOM_OVERRIDE_MIN_MINUTES
+    # 7a) alignment: refuse to trade INTO momentum. The 15m rule guards the
+    # late window; the session rule guards the WHOLE window against grinds.
+    yes_align_ok = not ((mom_down and mins < MOM_ALIGN_MINUTES) or sess_down)
+    no_align_ok = not ((mom_up and mins < MOM_ALIGN_MINUTES) or sess_up)
+
+    # 7b-ii) override is MOMENTUM-LED (was model-led, unreachable): the tape
+    # sets direction; the model only has to NOT disagree (p < 0.55 for NO,
+    # > 0.45 for YES). Inside the neutral band the stricter edge still applies.
+    no_override = (mom_down or sess_down) and p < MOM_OVERRIDE_PMAX and mins >= MOM_OVERRIDE_MIN_MINUTES
+    yes_override = (mom_up or sess_up) and p > (1.0 - MOM_OVERRIDE_PMAX) and mins >= MOM_OVERRIDE_MIN_MINUTES
 
     mid_yes_ok = mid >= (50.0 - MOM_OVERRIDE_BAND if yes_override else 50.0)
     mid_no_ok = mid < (50.0 + MOM_OVERRIDE_BAND if no_override else 50.0)
@@ -581,15 +615,21 @@ async def analyze_series(series: str, execute: bool = False):
     used_override = (side == "yes" and mid < 50.0) or (side == "no" and mid >= 50.0)
     result.update(edge=round(edge, 4), side=side, limit_price_cents=price_c,
                   ev_floor=round(min(floor_yes, floor_no), 4),
-                  r15=round(r15, 5), mid=round(mid, 1), momentum=momentum,
-                  override=used_override)
+                  r15=round(r15, 5), r45=round(r45, 5), mid=round(mid, 1),
+                  momentum=momentum, session=session, override=used_override)
     if not f["edge"]:
         would = "yes" if edge_yes >= edge_no else "no"
         raw_floor = floor_yes if would == "yes" else floor_no
         if would == "yes" and not yes_align_ok:
-            result["reason"] = f"momentum block: tape falling (r15 {round(r15*100,2)}%), no YES late in window"
+            if sess_down:
+                result["reason"] = f"session trend down (r45 {round(r45*100,2)}%), no YES into a grind"
+            else:
+                result["reason"] = f"momentum block: tape falling (r15 {round(r15*100,2)}%), no YES late in window"
         elif would == "no" and not no_align_ok:
-            result["reason"] = f"momentum block: tape rising (r15 {round(r15*100,2)}%), no NO late in window"
+            if sess_up:
+                result["reason"] = f"session trend up (r45 {round(r45*100,2)}%), no NO into a grind"
+            else:
+                result["reason"] = f"momentum block: tape rising (r15 {round(r15*100,2)}%), no NO late in window"
         elif (would == "yes" and not mid_yes_ok) or (would == "no" and not mid_no_ok):
             result["reason"] = f"edge {round(edge, 3)} but against market lean and no momentum override"
         elif max(edge_yes, edge_no) >= EDGE_THRESHOLD:
@@ -606,6 +646,7 @@ async def analyze_series(series: str, execute: bool = False):
     f["risk"] = (
         STATE["trades_today"] < MAX_TRADES_PER_DAY
         and ticker not in STATE["traded_tickers"]
+        and ticker not in STATE["guard_blacklist"]
         and (time.time() - cooled) > ATTEMPT_COOLDOWN_SEC
         and not over_spend_cap
     )
@@ -653,7 +694,7 @@ async def analyze_series(series: str, execute: bool = False):
             await tg_send(
                 f"ORDER {tag}{ov_tag}\n{ticker}\nbuy {side.upper()} x{TRADE_SIZE} @ {round(price_c, 1)}c\n"
                 f"model {round(p, 3)} - edge {round(edge, 3)} - expires in {round(mins, 1)}m\n"
-                f"r15 {round(r15 * 100, 2)}% - mid {round(mid, 1)}c - momentum {momentum}"
+                f"r15 {round(r15 * 100, 2)}% - mid {round(mid, 1)}c - momentum {momentum} - trend {session}"
             )
             if filled_n > 0:
                 # GUARD 2 - crash-fill dump (PATCH 3: hardened lookup).
@@ -662,6 +703,10 @@ async def analyze_series(series: str, execute: bool = False):
                     if await close_position(
                         pos, f"crash-fill guard: filled {round(fill_px, 1)}c < {FILL_FLOOR_CENTS:g}c"):
                         STATE["open_positions"].remove(pos)
+                        # PATCH 7b: never re-buy the knife we just dumped.
+                        if ticker not in STATE["guard_blacklist"]:
+                            STATE["guard_blacklist"].append(ticker)
+                            await tg_send(f"GUARD BLACKLIST\n{ticker}\nno re-entry on this contract.")
                 elif fill_px is None:
                     # PATCH 3: never stay silent. If we cannot verify the fill
                     # price, alert so you can eyeball it in the app.
@@ -1432,7 +1477,13 @@ def status():
         "edge_threshold": EDGE_THRESHOLD,
         "trade_size": TRADE_SIZE,
         "min_price_cents": MIN_PRICE_CENTS,
+        "max_price_cents": MAX_PRICE_CENTS,
         "fill_floor_cents": FILL_FLOOR_CENTS,
+        "mom": {"k": MOM_K, "align_minutes": MOM_ALIGN_MINUTES,
+                "session_minutes": MOM_SESSION_MINUTES, "session_k": MOM_SESSION_K,
+                "override_pmax": MOM_OVERRIDE_PMAX, "override_edge": MOM_OVERRIDE_EDGE,
+                "floor_pct": MOM_FLOOR_PCT},
+        "guard_blacklist": STATE["guard_blacklist"],
         "scanning": SCAN_SERIES,
         "take_profit_cents": TAKE_PROFIT_CENTS,
         "open_positions": [
