@@ -50,6 +50,12 @@ PATCHES vs previous build:
    redeploy can no longer reset the daily trade + spend caps (observed:
    25/25 filled, redeploy, fresh 25-trade budget). Loud Telegram alert on
    rehydrate success or failure.
+7d. Execution-seam fixes (Aug 9): Guard 1 now re-checks the PRICE BAND at
+   order time (was consensus-only - the 74c over-cap fill and 54c sub-floor
+   slide both slipped through a moved quote). Rehydrate reads dollar-encoded
+   price fields (fixes $0.0-spent bug). Crash-fill guard logs every verified
+   fill price and screams if the dump order itself fails (was silent - a 54c
+   fill rode to settlement).
 """
 
 import os
@@ -672,7 +678,9 @@ async def analyze_series(series: str, execute: bool = False):
             result["reason"] = "fresh-quote abort: book moved against the gate"
             await tg_send(
                 f"ORDER ABORTED\n{ticker}\nbook moved against the gate at order time"
-                f" (mid now {'?' if fresh_mid is None else round(fresh_mid, 1)}c) - no order sent")
+                f" (mid {'?' if fresh_mid is None else round(fresh_mid, 1)}c,"
+                f" price {'?' if fresh_px is None else round(fresh_px, 1)}c,"
+                f" band {MIN_PRICE_CENTS}-{MAX_PRICE_CENTS}c) - no order sent")
             return result
         price_c = fresh_px  # re-price off the LIVE book, not the stale snapshot
         order = await place_order(ticker, side, price_c, TRADE_SIZE)
@@ -704,6 +712,8 @@ async def analyze_series(series: str, execute: bool = False):
             if filled_n > 0:
                 # GUARD 2 - crash-fill dump (PATCH 3: hardened lookup).
                 fill_px = await actual_fill_price_cents(ticker, side, order)
+                if fill_px is not None:
+                    log.info(f"fill price {ticker}: {round(fill_px, 1)}c (floor {FILL_FLOOR_CENTS:g}c)")
                 if fill_px is not None and fill_px < FILL_FLOOR_CENTS:
                     if await close_position(
                         pos, f"crash-fill guard: filled {round(fill_px, 1)}c < {FILL_FLOOR_CENTS:g}c"):
@@ -712,6 +722,13 @@ async def analyze_series(series: str, execute: bool = False):
                         if ticker not in STATE["guard_blacklist"]:
                             STATE["guard_blacklist"].append(ticker)
                             await tg_send(f"GUARD BLACKLIST\n{ticker}\nno re-entry on this contract.")
+                    else:
+                        # PATCH 7d: a failed dump used to be silent (the 54c
+                        # fill that held to settlement, Aug 9). Now it yells.
+                        await tg_send(
+                            f"GUARD DUMP FAILED\n{ticker}\nfilled {round(fill_px, 1)}c"
+                            f" < {FILL_FLOOR_CENTS:g}c floor but the exit order did NOT fill."
+                            f" SELL IT IN THE APP NOW.")
                 elif fill_px is None:
                     # PATCH 3: never stay silent. If we cannot verify the fill
                     # price, alert so you can eyeball it in the app.
@@ -735,9 +752,15 @@ async def fresh_gate_recheck(ticker: str, side: str):
         if bid is None or ask is None:
             return False, None, None
         mid = (bid + ask) / 2.0
+        # PATCH 7d: re-check the PRICE BAND too, not just consensus. The 74c
+        # fill (Aug 9) and the 54c slide both passed the old mid-only check
+        # after the quote moved between scan and order.
         if side == "yes":
-            return (mid >= 50.0), ask, mid       # re-priced at the LIVE ask
-        return (mid < 50.0), (100.0 - bid), mid  # NO priced off the LIVE bid
+            ok = mid >= 50.0 and MIN_PRICE_CENTS <= ask <= MAX_PRICE_CENTS
+            return ok, ask, mid                  # re-priced at the LIVE ask
+        no_px = 100.0 - bid
+        ok = mid < 50.0 and MIN_PRICE_CENTS <= no_px <= MAX_PRICE_CENTS
+        return ok, no_px, mid                    # NO priced off the LIVE bid
     except Exception as e:
         log.error(f"fresh quote {ticker}: {e}")
         return False, None, None
@@ -918,9 +941,23 @@ async def rehydrate_state():
                 continue                      # entries only; exits don't consume caps
             side = (f.get("side") or "yes").lower()
             px = f.get("yes_price") if side == "yes" else f.get("no_price")
+            if px is None:
+                px = f.get("price")
+            if px is None:
+                # PATCH 7d: newer API returns dollar-encoded fields; the
+                # $0.0-spent bug (Aug 9) was reading cents fields that
+                # arrived as None.
+                raw = (f.get("yes_price_dollars") if side == "yes"
+                       else f.get("no_price_dollars")) or f.get("price_dollars")
+                px = float(raw) * 100.0 if raw is not None else None
+            if px is None:
+                continue
+            px = float(px)
+            if px <= 1.0:
+                px *= 100.0          # tolerate dollar encoding in any field
             cnt = float(f.get("count") or 0)
             trades += 1
-            spent += float(px or 0) * cnt
+            spent += px * cnt
             tk = f.get("ticker")
             if tk and tk not in tickers:
                 tickers.append(tk)
