@@ -56,6 +56,10 @@ PATCHES vs previous build:
    price fields (fixes $0.0-spent bug). Crash-fill guard logs every verified
    fill price and screams if the dump order itself fails (was silent - a 54c
    fill rode to settlement).
+7e. Rehydrate hotfixes (Aug 9): stamp STATE["day"] at boot so reset_daily
+   can't wipe the rebuilt counters on the first scan (45/25 -> traded again
+   2 min later), and read count_fp for spend (new API field - fixes the
+   persistent $0.0-spent bug).
 """
 
 import os
@@ -955,7 +959,9 @@ async def rehydrate_state():
             px = float(px)
             if px <= 1.0:
                 px *= 100.0          # tolerate dollar encoding in any field
-            cnt = float(f.get("count") or 0)
+            # PATCH 7e: new API returns count_fp (fixed-point string); the
+            # old "count" key arrives absent -> cnt 0 -> $0.0 spent bug.
+            cnt = float(f.get("count") or f.get("count_fp") or 0)
             trades += 1
             spent += px * cnt
             tk = f.get("ticker")
@@ -964,6 +970,10 @@ async def rehydrate_state():
         STATE["trades_today"] = trades
         STATE["spent_today_cents"] = spent
         STATE["traded_tickers"] = tickers
+        # PATCH 7e: stamp the day, else the first reset_daily() call after
+        # boot sees day="" and zeroes everything we just rebuilt (observed
+        # Aug 9: REHYDRATED 45/25 -> traded again 2 minutes later).
+        STATE["day"] = day_start.date().isoformat()
         log.info(f"rehydrated: {trades} trades, {round(spent,1)}c spent, {len(tickers)} tickers today")
         await tg_send(
             f"STATE REHYDRATED\ntoday so far: {trades}/{MAX_TRADES_PER_DAY} trades, "
