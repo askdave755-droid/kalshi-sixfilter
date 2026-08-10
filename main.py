@@ -67,6 +67,10 @@ PATCHES vs previous build:
    the reason logged; TRADING_HOURS_UTC env overrides; /status reports it.
    Ships with MAX_PRICE_CENTS raised to 75 (70-75c band = PF 2.33, the
    best slice) - set that in Railway Variables alongside this deploy.
+9. Backtest v2 data export (Aug 10, READ-ONLY): /export/start|status|
+   download pulls settled 15M markets + 1m candlesticks (live tier, ~3mo
+   window) into /tmp/bt_export NDJSON for offline replay against REAL
+   quotes. Guarded by EXPORT_KEY env. No orders, no money.
 """
 
 import os
@@ -78,11 +82,11 @@ import asyncio
 import logging
 import statistics
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel
 
 from cryptography.hazmat.primitives import hashes, serialization
@@ -1957,3 +1961,103 @@ error: {esc(ECON_STATE['last_error'] or '-')}<br>
 <h2>Econ market inventory</h2>
 <table><tr><th>Market</th><th>Mid</th><th>Base rate</th><th>Expires</th></tr>{rows_m}</table>
 </body></html>"""
+
+# ============================================================ PATCH 9 -----
+# Backtest v2 data export (READ-ONLY). Pulls settled 15-min markets plus
+# their 1-minute candlesticks from Kalshi (live tier, ~3-month window) so
+# the full stack can be replayed against REAL quotes instead of assumed
+# spreads. Guarded by EXPORT_KEY env; no orders, no money touched.
+EXPORT_KEY = env("EXPORT_KEY", default="")
+EXPORT_DIR = "/tmp/bt_export"
+EXPORT_STATE = {"running": False, "series": "", "done": 0, "total": 0,
+                "started": None, "error": None, "files": []}
+
+def _export_ok(key: str) -> bool:
+    return bool(EXPORT_KEY) and key == EXPORT_KEY
+
+async def _export_series(series: str, days: int):
+    os.makedirs(EXPORT_DIR, exist_ok=True)
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    # 1) all settled markets for the series (cursor pagination)
+    markets, cursor = [], ""
+    while True:
+        params = {"series_ticker": series, "status": "settled", "limit": 1000}
+        if cursor:
+            params["cursor"] = cursor
+        d = await kalshi_get("/markets", params=params)
+        batch = d.get("markets", [])
+        markets += [m for m in batch
+                    if m.get("result") in ("yes", "no")
+                    and m.get("close_time", "") >= since.isoformat().replace("+00:00", "Z")[:19] + "Z"]
+        cursor = d.get("cursor") or ""
+        if not cursor or not batch:
+            break
+        await asyncio.sleep(0.1)
+    EXPORT_STATE["total"] += len(markets)
+    fname = f"{series}_{days}d.ndjson"
+    path = os.path.join(EXPORT_DIR, fname)
+    sem = asyncio.Semaphore(4)
+    with open(path, "w") as fh:
+        for m in markets:
+            ticker = m.get("ticker", "")
+            try:
+                ot = int(datetime.fromisoformat(m["open_time"].replace("Z", "+00:00")).timestamp())
+                ct = int(datetime.fromisoformat(m["close_time"].replace("Z", "+00:00")).timestamp())
+                async with sem:
+                    cd = await kalshi_get(
+                        f"/series/{series}/markets/{ticker}/candlesticks",
+                        params={"start_ts": ot - 3600, "end_ts": ct + 60,
+                                "period_interval": 1})
+                    await asyncio.sleep(0.08)
+                rec = {"ticker": ticker, "result": m.get("result"),
+                       "strike": m.get("floor_strike"),
+                       "open_time": m.get("open_time"), "close_time": m.get("close_time"),
+                       "candles": cd.get("candlesticks", [])}
+                fh.write(json.dumps(rec) + "\n")
+            except Exception as e:
+                fh.write(json.dumps({"ticker": ticker, "error": str(e)[:120]}) + "\n")
+            EXPORT_STATE["done"] += 1
+    EXPORT_STATE["files"].append(fname)
+
+async def _export_run(series_list, days):
+    EXPORT_STATE.update(running=True, done=0, total=0, error=None,
+                        files=[], started=datetime.now(timezone.utc).isoformat())
+    try:
+        for s in series_list:
+            EXPORT_STATE["series"] = s
+            await _export_series(s, days)
+    except Exception as e:
+        EXPORT_STATE["error"] = str(e)[:200]
+        log.warning("export failed: %s", e)
+    finally:
+        EXPORT_STATE["running"] = False
+
+@app.get("/export/start")
+async def export_start(series: str = "KXBTC15M,KXETH15M", days: int = 30, key: str = ""):
+    if not _export_ok(key):
+        return {"ok": False, "error": "disabled or bad key (set EXPORT_KEY in Railway)"}
+    if EXPORT_STATE["running"]:
+        return {"ok": False, "error": "already running", "state": EXPORT_STATE}
+    days = max(1, min(int(days), 90))
+    series_list = [s.strip().upper() for s in series.split(",") if s.strip()]
+    asyncio.create_task(_export_run(series_list, days))
+    return {"ok": True, "series": series_list, "days": days}
+
+@app.get("/export/status")
+async def export_status(key: str = ""):
+    if not _export_ok(key):
+        return {"ok": False, "error": "disabled or bad key"}
+    return {"ok": True, "state": EXPORT_STATE}
+
+@app.get("/export/download/{fname}")
+async def export_download(fname: str, key: str = ""):
+    if not _export_ok(key):
+        return {"ok": False, "error": "disabled or bad key"}
+    if "/" in fname or ".." in fname:
+        return {"ok": False, "error": "bad name"}
+    path = os.path.join(EXPORT_DIR, fname)
+    if not os.path.exists(path):
+        return {"ok": False, "error": "no such file",
+                "files": EXPORT_STATE["files"]}
+    return FileResponse(path, filename=fname)
+
