@@ -75,6 +75,7 @@ PATCHES vs previous build:
 
 import os
 import re
+import json
 import time
 import math
 import base64
