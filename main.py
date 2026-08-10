@@ -60,6 +60,13 @@ PATCHES vs previous build:
    can't wipe the rebuilt counters on the first scan (45/25 -> traded again
    2 min later), and read count_fp for spend (new API field - fixes the
    persistent $0.0-spent bug).
+8. Trading-hours whitelist (Aug 10): full-week ledger calibration (n=363)
+   shows the edge only exists in UTC hours 1,2,5,6,9,12,13,21,23
+   (hour 22 = PF 0.26; replay of whitelist + 55-75c band = PF 2.13 vs
+   0.85 actual). Filter 0 in analyze_series skips all other hours with
+   the reason logged; TRADING_HOURS_UTC env overrides; /status reports it.
+   Ships with MAX_PRICE_CENTS raised to 75 (70-75c band = PF 2.33, the
+   best slice) - set that in Railway Variables alongside this deploy.
 """
 
 import os
@@ -182,6 +189,10 @@ MOM_FLOOR_PCT = env_float("MOM_FLOOR_PCT", default=0.0003)      # min threshold:
 MOM_SESSION_MINUTES = env_float("MOM_SESSION_MINUTES", default=45.0)  # session-trend lookback
 MOM_SESSION_K = env_float("MOM_SESSION_K", default=0.5)         # session threshold = K * sigma_session
 MOM_OVERRIDE_PMAX = env_float("MOM_OVERRIDE_PMAX", default=0.55)  # model only must NOT disagree (was <=0.40)
+
+TRADING_HOURS_UTC = {int(w.strip()) for w in env(
+    "TRADING_HOURS_UTC", default="1,2,5,6,9,12,13,21,23"
+).split(",") if w.strip()}
 
 TELEGRAM_BOT_TOKEN = env("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = env("TELEGRAM_CHAT_ID")
@@ -511,6 +522,16 @@ async def analyze_series(series: str, execute: bool = False):
         return result
 
     f = result["filters"]
+
+    # Filter 0 — trading-hours whitelist (PATCH 8, Aug 10): the full-week
+    # ledger (n=363) shows the edge only exists in certain UTC hours
+    # (1,2,5,6,9,12,13,21,23 profitable; e.g. hour 22 = PF 0.26).
+    hr_now = datetime.now(timezone.utc).hour
+    f["hours"] = hr_now in TRADING_HOURS_UTC
+    result["hour_utc"] = hr_now
+    if not f["hours"]:
+        result["reason"] = f"outside trading hours (utc hr {hr_now}, whitelist {sorted(TRADING_HOURS_UTC)})"
+        return result
 
     # Filter 1 — active market inside the expiry window
     pick, nearest_min = await fetch_active_market(series)
@@ -1579,6 +1600,7 @@ def status():
                 "override_pmax": MOM_OVERRIDE_PMAX, "override_edge": MOM_OVERRIDE_EDGE,
                 "floor_pct": MOM_FLOOR_PCT},
         "guard_blacklist": STATE["guard_blacklist"],
+        "trading_hours_utc": sorted(TRADING_HOURS_UTC),
         "scanning": SCAN_SERIES,
         "take_profit_cents": TAKE_PROFIT_CENTS,
         "open_positions": [
