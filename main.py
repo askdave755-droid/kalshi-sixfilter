@@ -737,6 +737,10 @@ async def analyze_series(series: str, execute: bool = False):
         price_c = fresh_px  # re-price off the LIVE book, not the stale snapshot
         if MAKER_MODE:
             order, mk_px = await post_maker_order(ticker, side, TRADE_SIZE)
+            if order and not order.get("ok") and "post only cross" in str(order.get("error", "")):
+                # 10a: the book moved in the ~200ms between quote and post.
+                # Re-read and retry ONCE at the fresh touch.
+                order, mk_px = await post_maker_order(ticker, side, TRADE_SIZE)
             result["order"] = order
             if order and order.get("ok"):
                 oid = (order.get("response") or {}).get("order", {}).get("order_id") or \
@@ -2191,3 +2195,4 @@ async def export_download(fname: str, key: str = ""):
         return {"ok": False, "error": "no such file",
                 "files": EXPORT_STATE["files"]}
     return FileResponse(path, filename=fname)
+
