@@ -71,6 +71,13 @@ PATCHES vs previous build:
    download pulls settled 15M markets + 1m candlesticks (live tier, ~3mo
    window) into /tmp/bt_export NDJSON for offline replay against REAL
    quotes. Guarded by EXPORT_KEY env. No orders, no money.
+10. Maker mode (Aug 10): backtest v2 (30d, 5,688 markets, real quotes)
+   showed identical signals lose as taker (PF 0.93, -$18) but profit as
+   maker (PF 1.05, +$13) - friction, not signal, was the leak. MAKER_MODE=1
+   posts resting post_only GTC bids at the live quote (0 maker fee),
+   MAKER_TTL_SEC (default 90) cancels unfilled orders; fills consume daily
+   caps like taker fills; crash-fill guard + blacklist apply; startup
+   sweep cancels strays after restarts. Off by default (env-gated).
 """
 
 import os
@@ -198,6 +205,12 @@ MOM_OVERRIDE_PMAX = env_float("MOM_OVERRIDE_PMAX", default=0.55)  # model only m
 TRADING_HOURS_UTC = {int(w.strip()) for w in env(
     "TRADING_HOURS_UTC", default="1,2,5,6,9,12,13,21,23"
 ).split(",") if w.strip()}
+
+# PATCH 10: maker mode. Post resting bids (0 fee, collect spread) instead of
+# crossing the spread as taker. Backtest v2 (30d, real quotes): taker PF 0.93
+# (-$18) vs maker PF 1.05 (+$13) on IDENTICAL signals - friction was the leak.
+MAKER_MODE = env_int("MAKER_MODE", default=0)          # 1 = post resting bids
+MAKER_TTL_SEC = env_float("MAKER_TTL_SEC", default=90.0)  # cancel if unfilled
 
 TELEGRAM_BOT_TOKEN = env("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = env("TELEGRAM_CHAT_ID")
@@ -377,6 +390,13 @@ async def kalshi_post(endpoint: str, body: dict):
         r.raise_for_status()
         return r.json()
 
+async def kalshi_delete(endpoint: str):
+    headers = _sign_headers("DELETE", endpoint)
+    async with httpx.AsyncClient(base_url=BASE_URL, timeout=15) as c:
+        r = await c.delete(endpoint, headers=headers)
+        r.raise_for_status()
+        return r.json() if r.text else {}
+
 # ---------------------------------------------------------------- binance ---
 # Recalibration constants, sized from the 7-day backtest (~3,300 windows per
 # horizon per asset): >10min out the model's extremes ran 10-14pts hot, and
@@ -432,6 +452,7 @@ STATE = {
     "spent_today_cents": 0.0,
     "traded_tickers": [],
     "guard_blacklist": [],   # PATCH 7b: tickers dump-guarded off; no re-entry til next day
+    "maker_orders": [],      # PATCH 10: resting bids awaiting fill/TTL
     "open_positions": [],
     "attempt_cooldown": {},
     "last_scan": None,
@@ -688,6 +709,7 @@ async def analyze_series(series: str, execute: bool = False):
         STATE["trades_today"] < MAX_TRADES_PER_DAY
         and ticker not in STATE["traded_tickers"]
         and ticker not in STATE["guard_blacklist"]
+        and all(mo["ticker"] != ticker for mo in STATE["maker_orders"])
         and (time.time() - cooled) > ATTEMPT_COOLDOWN_SEC
         and not over_spend_cap
     )
@@ -713,6 +735,28 @@ async def analyze_series(series: str, execute: bool = False):
                 f" band {MIN_PRICE_CENTS}-{MAX_PRICE_CENTS}c) - no order sent")
             return result
         price_c = fresh_px  # re-price off the LIVE book, not the stale snapshot
+        if MAKER_MODE:
+            order, mk_px = await post_maker_order(ticker, side, TRADE_SIZE)
+            result["order"] = order
+            if order and order.get("ok"):
+                oid = (order.get("response") or {}).get("order", {}).get("order_id") or \
+                      (order.get("response") or {}).get("order_id")
+                if oid:
+                    STATE["maker_orders"].append({
+                        "order_id": oid, "ticker": ticker, "side": side,
+                        "px": mk_px, "count": float(TRADE_SIZE), "ts": time.time(),
+                        "p": p, "edge": edge, "mins": mins})
+                    await tg_send(
+                        f"MAKER POSTED\n{ticker}\nresting buy {side.upper()} x{TRADE_SIZE} @ {round(mk_px, 1)}c"
+                        f" (0 fee if filled, ttl {int(MAKER_TTL_SEC)}s)\n"
+                        f"model {round(p, 3)} - edge {round(edge, 3)} - expires in {round(mins, 1)}m\n"
+                        f"r15 {round(r15 * 100, 2)}% - mid {round(mid, 1)}c - momentum {momentum} - trend {session}")
+                else:
+                    await tg_send(f"MAKER POST FAILED\n{ticker}\nno order id returned - not counted, no cost")
+            else:
+                why = (order or {}).get("error") or f"maker price {mk_px} outside band {MIN_PRICE_CENTS}-{MAX_PRICE_CENTS}c"
+                await tg_send(f"MAKER POST FAILED\n{ticker}\n{str(why)[:200]}")
+            return result
         order = await place_order(ticker, side, price_c, TRADE_SIZE)
         result["order"] = order
         if order.get("ok"):
@@ -838,12 +882,80 @@ async def actual_fill_price_cents(ticker: str, side: str, order: dict):
     log.error(f"FILL PRICE NOT FOUND for {ticker} after retries - guard skipped")
     return None
 
-async def place_order(ticker: str, side: str, price_cents: float, count: int, reduce_only: bool = False):
+async def post_maker_order(ticker: str, side: str, count: int):
+    """PATCH 10: post a resting bid at the live quote. YES rests at yes_bid;
+    NO rests at (100 - yes_ask) = the NO bid. Band-checked on the maker px."""
+    data = await kalshi_get(f"/markets/{ticker}")
+    m = data.get("market", {})
+    if side == "yes":
+        px = cents(m, "yes_bid")
+    else:
+        ask = cents(m, "yes_ask")
+        px = None if ask is None else 100.0 - ask
+    if px is None or not (MIN_PRICE_CENTS <= px <= MAX_PRICE_CENTS):
+        return None, px
+    order = await place_order(ticker, side, px, count, maker=True)
+    return order, px
+
+async def manage_maker_orders():
+    """PATCH 10: poll resting maker orders each scan. Fills consume the daily
+    caps exactly like taker fills (0 maker fee); stale orders are canceled."""
+    pending = STATE["maker_orders"]
+    if not pending:
+        return
+    for mo in list(pending):
+        try:
+            d = await kalshi_get(f"/portfolio/orders/{mo['order_id']}")
+            o = d.get("order", d) if isinstance(d, dict) else {}
+            raw = o.get("fill_count_fp") or o.get("fill_count") or "0"
+            try:
+                filled = float(raw)
+            except (TypeError, ValueError):
+                filled = 0.0
+            status = str(o.get("status") or "")
+            age = time.time() - mo["ts"]
+            if filled > 0:
+                n = min(filled, mo["count"])
+                STATE["trades_today"] += 1
+                STATE["spent_today_cents"] += mo["px"] * n
+                STATE["traded_tickers"].append(mo["ticker"])
+                pos = {"ticker": mo["ticker"], "side": mo["side"], "count": n,
+                       "entry_c": mo["px"], "ts": time.time()}
+                STATE["open_positions"].append(pos)
+                pending.remove(mo)
+                await tg_send(
+                    f"MAKER FILLED\n{mo['ticker']}\nbuy {mo['side'].upper()} x{filled:g} @ {round(mo['px'], 1)}c"
+                    f" (0 maker fee, rested {int(age)}s)\n"
+                    f"model {round(mo['p'], 3)} - edge {round(mo['edge'], 3)} - expires in {round(mo['mins'], 1)}m")
+                # crash-fill guard applies to maker fills too
+                if mo["px"] < FILL_FLOOR_CENTS:
+                    if await close_position(pos, f"crash-fill guard: maker fill {round(mo['px'], 1)}c < {FILL_FLOOR_CENTS:g}c"):
+                        STATE["open_positions"].remove(pos)
+                        if mo["ticker"] not in STATE["guard_blacklist"]:
+                            STATE["guard_blacklist"].append(mo["ticker"])
+                            await tg_send(f"GUARD BLACKLIST\n{mo['ticker']}\nno re-entry on this contract.")
+            elif status in ("canceled", "cancelled", "failed", "expired") or age > MAKER_TTL_SEC:
+                try:
+                    await kalshi_delete(f"/portfolio/orders/{mo['order_id']}")
+                except Exception:
+                    pass
+                pending.remove(mo)
+                log.info(f"maker order gone unfilled: {mo['ticker']} ({status or 'ttl'}, {int(age)}s)")
+                await tg_send(
+                    f"MAKER EXPIRED\n{mo['ticker']}\nrested {int(age)}s unfilled - canceled, no cost")
+        except Exception as e:
+            log.warning(f"maker manage error {mo.get('ticker')}: {e}")
+
+async def place_order(ticker: str, side: str, price_cents: float, count: int, reduce_only: bool = False, maker: bool = False):
     """Kalshi Create Order V2: /portfolio/events/orders.
     - buy YES at p cents -> side="bid", price=p/100
     - buy NO at q cents -> side="ask", price=(100-q)/100
     """
-    if side == "yes":
+    if maker:
+        # Resting order at the exact quote: no buffer, post_only, GTC.
+        v2_price = min(max(price_cents, 1.0), 99.0) / 100.0
+        v2_side = "bid" if side == "yes" else "ask"
+    elif side == "yes":
         v2_side = "bid"
         v2_price = min(price_cents + TAKER_BUFFER_CENTS, 99.0) / 100.0
     else:
@@ -855,9 +967,9 @@ async def place_order(ticker: str, side: str, price_cents: float, count: int, re
         "side": v2_side,
         "count": f"{float(count):.2f}",
         "price": f"{v2_price:.4f}",
-        "time_in_force": "immediate_or_cancel",
+        "time_in_force": "good_till_canceled" if maker else "immediate_or_cancel",
         "self_trade_prevention_type": "taker_at_cross",
-        "post_only": False,
+        "post_only": maker,
         "reduce_only": reduce_only,
     }
     try:
@@ -1016,6 +1128,18 @@ async def auto_loop():
     await rehydrate_state()
     log.info(f"scanner up: {SCAN_SERIES} every {SCAN_INTERVAL_SEC}s - auto_trade={AUTO_TRADE}")
     await tg_send(f"SixFilter online.\nScanning: {', '.join(SCAN_SERIES)}\nAuto-trade: {AUTO_TRADE}")
+    if MAKER_MODE:
+        try:
+            d = await kalshi_get("/portfolio/orders")
+            n_cancel = 0
+            for o in (d.get("orders", []) if isinstance(d, dict) else []):
+                oid = o.get("order_id")
+                if oid:
+                    await kalshi_delete(f"/portfolio/orders/{oid}")
+                    n_cancel += 1
+            log.info(f"maker startup sweep: canceled {n_cancel} stray resting order(s)")
+        except Exception as e:
+            log.warning(f"maker startup sweep failed: {e}")
     while True:
         if AUTO_TRADE and not STATE["paused"]:
             try:
@@ -1027,6 +1151,10 @@ async def auto_loop():
             await monitor_positions()
         except Exception as e:
             log.error(f"position monitor error: {e}")
+        try:
+            await manage_maker_orders()
+        except Exception as e:
+            log.error(f"maker manager error: {e}")
         await asyncio.sleep(SCAN_INTERVAL_SEC)
 
 # --------------------------------------------- polymarket intelligence ------
@@ -1606,6 +1734,8 @@ def status():
                 "floor_pct": MOM_FLOOR_PCT},
         "guard_blacklist": STATE["guard_blacklist"],
         "trading_hours_utc": sorted(TRADING_HOURS_UTC),
+        "maker_mode": bool(MAKER_MODE),
+        "maker_pending": len(STATE["maker_orders"]),
         "scanning": SCAN_SERIES,
         "take_profit_cents": TAKE_PROFIT_CENTS,
         "open_positions": [
@@ -2061,4 +2191,3 @@ async def export_download(fname: str, key: str = ""):
         return {"ok": False, "error": "no such file",
                 "files": EXPORT_STATE["files"]}
     return FileResponse(path, filename=fname)
-
