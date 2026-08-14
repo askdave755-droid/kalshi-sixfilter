@@ -78,6 +78,13 @@ PATCHES vs previous build:
    MAKER_TTL_SEC (default 90) cancels unfilled orders; fills consume daily
    caps like taker fills; crash-fill guard + blacklist apply; startup
    sweep cancels strays after restarts. Off by default (env-gated).
+11. Export strike-kind filter (kind=greater|less|all) for daily-market pulls.
+12. SOL engine (Aug 14): KXSOL15M mapped to SOLUSDT. 30d replay through the
+   exact production stack (maker mode, hours whitelist, 55-75c band):
+   296 trades, 65.5% WR, PF 1.15, +$9.27 (XRP failed: PF 0.82, skipped).
+   Per-series sizing via SERIES_SIZE / size_for() - SOL trades its own size
+   (SIZE_KXSOL15M env, default 1) independent of CONTRACT_SIZE. Requires
+   KXSOL15M added to SCAN_SERIES in Railway Variables.
 """
 
 import os
@@ -129,6 +136,7 @@ SERIES_SYMBOLS = {
     "KXBTC1H": "BTCUSDT",
     "KXETH1H": "ETHUSDT",
     "KXEURUSD": "EURUSDT",  # Binance EURUSDT ~ EURUSD spot
+    "KXSOL15M": "SOLUSDT",  # PATCH 12: SOL engine (30d replay PF 1.15, 65.5% WR)
 }
 
 def env_int(*names, default=0):
@@ -154,6 +162,11 @@ def _edge_value():
 
 EDGE_THRESHOLD = _edge_value()          # minimum model-vs-market edge
 TRADE_SIZE = env_int("TRADE_SIZE", "CONTRACT_SIZE", default=1)
+# PATCH 12: per-series size overrides. SOL runs its own size (default 1)
+# while BTC/ETH keep CONTRACT_SIZE. Env: SIZE_KXSOL15M etc.
+SERIES_SIZE = {"KXSOL15M": env_int("SIZE_KXSOL15M", "SOL_SIZE", default=1)}
+def size_for(series: str) -> int:
+    return SERIES_SIZE.get(series, TRADE_SIZE)
 MAX_TRADES_PER_DAY = env_int("MAX_TRADES_PER_DAY", default=10)
 DAILY_LOSS_LIMIT = env_float("DAILY_LOSS_LIMIT", default=0.0)  # dollars/day cap; 0 = off
 MIN_MINUTES_TO_EXPIRY = env_float("MIN_MINUTES_TO_EXPIRY", default=3.0)
@@ -546,6 +559,7 @@ async def analyze_series(series: str, execute: bool = False):
     if not symbol:
         result["reason"] = "no price feed mapped for this series"
         return result
+    sz = size_for(series)  # PATCH 12: per-series contract size
 
     f = result["filters"]
 
@@ -657,8 +671,8 @@ async def analyze_series(series: str, execute: bool = False):
     edge_yes = p - yes_ask / 100.0
     edge_no = (yes_bid / 100.0) - p
 
-    fee_yes_c = kalshi_taker_fee_cents(yes_ask, TRADE_SIZE) / max(TRADE_SIZE, 1)
-    fee_no_c = kalshi_taker_fee_cents(100.0 - yes_bid, TRADE_SIZE) / max(TRADE_SIZE, 1)
+    fee_yes_c = kalshi_taker_fee_cents(yes_ask, sz) / max(sz, 1)
+    fee_no_c = kalshi_taker_fee_cents(100.0 - yes_bid, sz) / max(sz, 1)
     floor_yes = EDGE_THRESHOLD + fee_yes_c / 100.0
     floor_no = EDGE_THRESHOLD + fee_no_c / 100.0
     # inside the override's neutral band, demand the stricter edge
@@ -702,7 +716,7 @@ async def analyze_series(series: str, execute: bool = False):
 
     # Filter 6 — risk limits (trade count, duplicates, cooldown, daily spend cap)
     cooled = STATE["attempt_cooldown"].get(ticker, 0)
-    cost_cents = (price_c or 0) * TRADE_SIZE
+    cost_cents = (price_c or 0) * sz
     spend_cap_cents = DAILY_LOSS_LIMIT * 100.0
     over_spend_cap = spend_cap_cents > 0 and (STATE["spent_today_cents"] + cost_cents) > spend_cap_cents
     f["risk"] = (
@@ -736,11 +750,11 @@ async def analyze_series(series: str, execute: bool = False):
             return result
         price_c = fresh_px  # re-price off the LIVE book, not the stale snapshot
         if MAKER_MODE:
-            order, mk_px = await post_maker_order(ticker, side, TRADE_SIZE)
+            order, mk_px = await post_maker_order(ticker, side, sz)
             if order and not order.get("ok") and "post only cross" in str(order.get("error", "")):
                 # 10a: the book moved in the ~200ms between quote and post.
                 # Re-read and retry ONCE at the fresh touch.
-                order, mk_px = await post_maker_order(ticker, side, TRADE_SIZE)
+                order, mk_px = await post_maker_order(ticker, side, sz)
             result["order"] = order
             if order and order.get("ok"):
                 oid = (order.get("response") or {}).get("order", {}).get("order_id") or \
@@ -748,10 +762,10 @@ async def analyze_series(series: str, execute: bool = False):
                 if oid:
                     STATE["maker_orders"].append({
                         "order_id": oid, "ticker": ticker, "side": side,
-                        "px": mk_px, "count": float(TRADE_SIZE), "ts": time.time(),
+                        "px": mk_px, "count": float(sz), "ts": time.time(),
                         "p": p, "edge": edge, "mins": mins})
                     await tg_send(
-                        f"MAKER POSTED\n{ticker}\nresting buy {side.upper()} x{TRADE_SIZE} @ {round(mk_px, 1)}c"
+                        f"MAKER POSTED\n{ticker}\nresting buy {side.upper()} x{sz} @ {round(mk_px, 1)}c"
                         f" (0 fee if filled, ttl {int(MAKER_TTL_SEC)}s)\n"
                         f"model {round(p, 3)} - edge {round(edge, 3)} - expires in {round(mins, 1)}m\n"
                         f"r15 {round(r15 * 100, 2)}% - mid {round(mid, 1)}c - momentum {momentum} - trend {session}")
@@ -761,20 +775,20 @@ async def analyze_series(series: str, execute: bool = False):
                 why = (order or {}).get("error") or f"maker price {mk_px} outside band {MIN_PRICE_CENTS}-{MAX_PRICE_CENTS}c"
                 await tg_send(f"MAKER POST FAILED\n{ticker}\n{str(why)[:200]}")
             return result
-        order = await place_order(ticker, side, price_c, TRADE_SIZE)
+        order = await place_order(ticker, side, price_c, sz)
         result["order"] = order
         if order.get("ok"):
             filled_n = float(order.get("filled") or 0)
             if filled_n > 0:
                 # Only real fills consume the daily trade/spend caps.
                 STATE["trades_today"] += 1
-                STATE["spent_today_cents"] += (price_c + TAKER_BUFFER_CENTS) * min(filled_n, float(TRADE_SIZE))
+                STATE["spent_today_cents"] += (price_c + TAKER_BUFFER_CENTS) * min(filled_n, float(sz))
                 STATE["traded_tickers"].append(ticker)
                 pos = {"ticker": ticker, "side": side,
-                       "count": min(filled_n, float(TRADE_SIZE)),
+                       "count": min(filled_n, float(sz)),
                        "entry_c": price_c + TAKER_BUFFER_CENTS, "ts": time.time()}
                 STATE["open_positions"].append(pos)
-                tag = "FILLED" if filled_n >= TRADE_SIZE else f"PARTIAL {filled_n:g}/{TRADE_SIZE}"
+                tag = "FILLED" if filled_n >= sz else f"PARTIAL {filled_n:g}/{sz}"
             else:
                 tag = "NOT FILLED (book moved - no cost, not counted)"
             ov_tag = ""
@@ -783,7 +797,7 @@ async def analyze_series(series: str, execute: bool = False):
             elif side == "yes" and yes_override and mid < 50.0:
                 ov_tag = " [MOM OVERRIDE]"
             await tg_send(
-                f"ORDER {tag}{ov_tag}\n{ticker}\nbuy {side.upper()} x{TRADE_SIZE} @ {round(price_c, 1)}c\n"
+                f"ORDER {tag}{ov_tag}\n{ticker}\nbuy {side.upper()} x{sz} @ {round(price_c, 1)}c\n"
                 f"model {round(p, 3)} - edge {round(edge, 3)} - expires in {round(mins, 1)}m\n"
                 f"r15 {round(r15 * 100, 2)}% - mid {round(mid, 1)}c - momentum {momentum} - trend {session}"
             )
@@ -1729,6 +1743,7 @@ def status():
         "daily_loss_limit": DAILY_LOSS_LIMIT,
         "edge_threshold": EDGE_THRESHOLD,
         "trade_size": TRADE_SIZE,
+        "series_sizes": {s: size_for(s) for s in SCAN_SERIES},
         "min_price_cents": MIN_PRICE_CENTS,
         "max_price_cents": MAX_PRICE_CENTS,
         "fill_floor_cents": FILL_FLOOR_CENTS,
