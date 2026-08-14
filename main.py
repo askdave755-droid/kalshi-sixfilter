@@ -2110,7 +2110,7 @@ EXPORT_STATE = {"running": False, "series": "", "done": 0, "total": 0,
 def _export_ok(key: str) -> bool:
     return bool(EXPORT_KEY) and key == EXPORT_KEY
 
-async def _export_series(series: str, days: int):
+async def _export_series(series: str, days: int, kind: str = ""):
     os.makedirs(EXPORT_DIR, exist_ok=True)
     since = datetime.now(timezone.utc) - timedelta(days=days)
     # 1) all settled markets for the series (cursor pagination)
@@ -2123,6 +2123,7 @@ async def _export_series(series: str, days: int):
         batch = d.get("markets", [])
         markets += [m for m in batch
                     if m.get("result") in ("yes", "no")
+                    and (not kind or m.get("strike_type") == kind)
                     and m.get("close_time", "") >= since.isoformat().replace("+00:00", "Z")[:19] + "Z"]
         cursor = d.get("cursor") or ""
         if not cursor or not batch:
@@ -2154,13 +2155,13 @@ async def _export_series(series: str, days: int):
             EXPORT_STATE["done"] += 1
     EXPORT_STATE["files"].append(fname)
 
-async def _export_run(series_list, days):
+async def _export_run(series_list, days, kind=""):
     EXPORT_STATE.update(running=True, done=0, total=0, error=None,
                         files=[], started=datetime.now(timezone.utc).isoformat())
     try:
         for s in series_list:
             EXPORT_STATE["series"] = s
-            await _export_series(s, days)
+            await _export_series(s, days, kind)
     except Exception as e:
         EXPORT_STATE["error"] = str(e)[:200]
         log.warning("export failed: %s", e)
@@ -2168,15 +2169,15 @@ async def _export_run(series_list, days):
         EXPORT_STATE["running"] = False
 
 @app.get("/export/start")
-async def export_start(series: str = "KXBTC15M,KXETH15M", days: int = 30, key: str = ""):
+async def export_start(series: str = "KXBTC15M,KXETH15M", days: int = 30, key: str = "", kind: str = ""):
     if not _export_ok(key):
         return {"ok": False, "error": "disabled or bad key (set EXPORT_KEY in Railway)"}
     if EXPORT_STATE["running"]:
         return {"ok": False, "error": "already running", "state": EXPORT_STATE}
     days = max(1, min(int(days), 90))
     series_list = [s.strip().upper() for s in series.split(",") if s.strip()]
-    asyncio.create_task(_export_run(series_list, days))
-    return {"ok": True, "series": series_list, "days": days}
+    asyncio.create_task(_export_run(series_list, days, kind))
+    return {"ok": True, "series": series_list, "days": days, "kind": kind or "all"}
 
 @app.get("/export/status")
 async def export_status(key: str = ""):
