@@ -85,6 +85,12 @@ PATCHES vs previous build:
    Per-series sizing via SERIES_SIZE / size_for() - SOL trades its own size
    (SIZE_KXSOL15M env, default 1) independent of CONTRACT_SIZE. Requires
    KXSOL15M added to SCAN_SERIES in Railway Variables.
+13. Anti-martingale press experiment (Aug 15, SOL only): maker-era fills
+   showed wins cluster (17-streak; win->2/loss->1 would have made +$21 vs
+   +$9 flat on identical trades). update_press_state() settles press-series
+   positions each scan: win presses next size +1 (cap PRESS_MAX, default 2),
+   loss resets to base. Live A/B vs flat-1; graded at 30 trades from CSVs.
+   PRESS_SERIES env ("" disables). BTC/ETH stay flat CONTRACT_SIZE.
 """
 
 import os
@@ -165,7 +171,18 @@ TRADE_SIZE = env_int("TRADE_SIZE", "CONTRACT_SIZE", default=1)
 # PATCH 12: per-series size overrides. SOL runs its own size (default 1)
 # while BTC/ETH keep CONTRACT_SIZE. Env: SIZE_KXSOL15M etc.
 SERIES_SIZE = {"KXSOL15M": env_int("SIZE_KXSOL15M", "SOL_SIZE", default=1)}
+# PATCH 13: anti-martingale press experiment, SOL only. Live A/B vs flat-1:
+# maker-era data showed wins cluster (17-streak; win->2 would have doubled
+# P&L on identical fills). Win -> size 2, loss -> back to 1, never above
+# PRESS_MAX. BTC/ETH untouched. State resets to base size on redeploy
+# (conservative). PRESS_SERIES env to extend/disable ("" = off).
+PRESS_SERIES = {s.strip().upper() for s in env(
+    "PRESS_SERIES", default="KXSOL15M").split(",") if s.strip()}
+PRESS_MAX = env_int("PRESS_MAX", default=2)
 def size_for(series: str) -> int:
+    if series in PRESS_SERIES:
+        base = SERIES_SIZE.get(series, 1)
+        return max(1, min(PRESS_MAX, STATE["press"].get(series, base)))
     return SERIES_SIZE.get(series, TRADE_SIZE)
 MAX_TRADES_PER_DAY = env_int("MAX_TRADES_PER_DAY", default=10)
 DAILY_LOSS_LIMIT = env_float("DAILY_LOSS_LIMIT", default=0.0)  # dollars/day cap; 0 = off
@@ -466,6 +483,7 @@ STATE = {
     "traded_tickers": [],
     "guard_blacklist": [],   # PATCH 7b: tickers dump-guarded off; no re-entry til next day
     "maker_orders": [],      # PATCH 10: resting bids awaiting fill/TTL
+    "press": {},             # PATCH 13: series -> current pressed size
     "open_positions": [],
     "attempt_cooldown": {},
     "last_scan": None,
@@ -964,6 +982,38 @@ async def manage_maker_orders():
         except Exception as e:
             log.warning(f"maker manage error {mo.get('ticker')}: {e}")
 
+async def update_press_state():
+    """PATCH 13: settle-watcher for press series. Each scan, check open
+    press-series positions; when the market has settled, press the next
+    trade's size up on a win, reset to base on a loss, and prune the
+    settled position (also fixes stale-position buildup for these series)."""
+    if not PRESS_SERIES:
+        return
+    for pos in list(STATE["open_positions"]):
+        series = next((s for s in PRESS_SERIES if pos["ticker"].startswith(s)), None)
+        if not series:
+            continue
+        try:
+            data = await kalshi_get(f"/markets/{pos['ticker']}")
+            m = data.get("market", {})
+            result = (m.get("result") or "").lower()
+            if result not in ("yes", "no"):
+                continue  # still trading
+            win = pos["side"] == result
+            base = SERIES_SIZE.get(series, 1)
+            cur = STATE["press"].get(series, base)
+            new = min(cur + 1, PRESS_MAX) if win else base
+            STATE["press"][series] = new
+            STATE["open_positions"].remove(pos)
+            n = pos.get("count", base)
+            pnl = (100.0 - pos["entry_c"]) * n / 100.0 if win else -pos["entry_c"] * n / 100.0
+            await tg_send(
+                f"PRESS {'UP' if win and new > base else ('SET' if win else 'RESET')}\n{pos['ticker']}\n"
+                f"{'WIN' if win else 'LOSS'} {'+' if pnl >= 0 else ''}{round(pnl, 2)}$ "
+                f"-> next {series} size {new}")
+        except Exception as e:
+            log.warning(f"press update error {pos.get('ticker')}: {e}")
+
 async def place_order(ticker: str, side: str, price_cents: float, count: int, reduce_only: bool = False, maker: bool = False):
     """Kalshi Create Order V2: /portfolio/events/orders.
     - buy YES at p cents -> side="bid", price=p/100
@@ -1173,6 +1223,10 @@ async def auto_loop():
             await manage_maker_orders()
         except Exception as e:
             log.error(f"maker manager error: {e}")
+        try:
+            await update_press_state()
+        except Exception as e:
+            log.error(f"press update error: {e}")
         await asyncio.sleep(SCAN_INTERVAL_SEC)
 
 # --------------------------------------------- polymarket intelligence ------
@@ -1744,6 +1798,7 @@ def status():
         "edge_threshold": EDGE_THRESHOLD,
         "trade_size": TRADE_SIZE,
         "series_sizes": {s: size_for(s) for s in SCAN_SERIES},
+        "press": STATE["press"],
         "min_price_cents": MIN_PRICE_CENTS,
         "max_price_cents": MAX_PRICE_CENTS,
         "fill_floor_cents": FILL_FLOOR_CENTS,
