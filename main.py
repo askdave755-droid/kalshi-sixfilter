@@ -89,8 +89,23 @@ PATCHES vs previous build:
    showed wins cluster (17-streak; win->2/loss->1 would have made +$21 vs
    +$9 flat on identical trades). update_press_state() settles press-series
    positions each scan: win presses next size +1 (cap PRESS_MAX, default 2),
-   loss resets to base. Live A/B vs flat-1; graded at 30 trades from CSVs.
-   PRESS_SERIES env ("" disables). BTC/ETH stay flat CONTRACT_SIZE.
+   loss resets to base. CLOSED Aug 17: SOL wins don't cluster (press cost
+   -$0.94 vs flat over 3 presses); PRESS_SERIES=OFF in production.
+14. Econ scanner v2 (Aug 17): v1's "gaps" were artifacts - it answered
+   threshold questions ("CPI above 6%?") with bracket-mass lookups and fed
+   YoY questions a month-over-month distribution. v2 keeps raw FRED samples
+   (ECON_DIST) and answers P(dist >= x) / P(dist < x) via empirical CDF
+   (static normal fallback); claims/CPI parse above-below thresholds; YoY vs
+   m/m detected per market. Paper ledger now persists to
+   /tmp/econ_paper.ndjson and rehydrates on boot - redeploys no longer wipe
+   the record. Still PAPER ONLY - no orders.
+15. Polymarket measurement layer (Aug 17): user's Poly jurisdiction solved.
+   Before any build, we measure: poly_scan_once now inventories Poly crypto
+   up/down markets (POLY_STATE["crypto_pm"]) and logs candidate gaps vs
+   Kalshi 15M mids (POLY_STATE["cand_gaps"], alert >= POLY_GAP_ALERT_C,
+   1h dedupe, tagged UNVERIFIED TERMS - resolution terms auto-matched by
+   theme, never trusted for money without a manual check). Both surfaces
+   exposed in /poly. Read-only; no Poly execution exists yet.
 """
 
 import os
@@ -298,6 +313,29 @@ BASE_CPI = [       # (upper_bound_m/m_pct, probability) CPI all-items SA
     (0.4, 0.18), (0.5, 0.12), (0.6, 0.06), (10**9, 0.04),
 ]
 
+# PATCH 14 (Aug 17): econ scanner v2. v1 compared bracket-mass tables against
+# threshold questions ("above 6%?" got "P(in bracket 5.5-6.0)") and measured
+# YoY questions against a MONTH-OVER-MONTH distribution - the "gaps" were
+# artifacts. v2 keeps raw empirical samples and answers P(dist >= x) /
+# P(dist < x) directly. Static normals are the no-FRED fallback.
+ECON_DIST = {"claims": [], "cpi_mm": [], "cpi_yoy": []}
+ECON_STATIC = {  # (mean, std) normal fallbacks, ~5y history shape
+    "claims": (220.0, 25.0),    # thousands, weekly initial claims
+    "cpi_mm": (0.25, 0.30),     # m/m %
+    "cpi_yoy": (3.5, 2.2),      # y/y % (includes the 21-22 spike)
+}
+
+def _norm_cdf(x, mu, sd):
+    return 0.5 * (1.0 + math.erf((x - mu) / (sd * math.sqrt(2.0))))
+
+def dist_cdf(kind: str, x: float) -> float:
+    """P(dist < x): empirical CDF over FRED samples, static normal fallback."""
+    samples = ECON_DIST.get(kind) or []
+    if len(samples) >= 20:
+        return sum(1 for v in samples if v < x) / len(samples)
+    mu, sd = ECON_STATIC[kind]
+    return _norm_cdf(x, mu, sd)
+
 # FRED (Federal Reserve Economic Data) - free official API. When FRED_API_KEY
 # is set, the static tables above are REPLACED at startup (and daily) with
 # base rates computed from real history: ICSA weekly claims + CPIAUCSL m/m.
@@ -351,7 +389,14 @@ async def refresh_base_rates():
         b2 = _compute_brackets(cpi_mm, [ub for ub, _ in BASE_CPI])
         if b2:
             BASE_CPI = b2
-        ECON_STATE["fred"] = f"claims n={len(claims)}, cpi n={len(cpi_mm)}"
+        # PATCH 14: keep the RAW samples too - bracket-mass tables cannot
+        # answer threshold questions ("above X%?"), the distribution can.
+        cpi_yoy = [100.0 * (cpi_idx[i] / cpi_idx[i - 12] - 1.0)
+                   for i in range(12, len(cpi_idx)) if cpi_idx[i - 12] > 0]
+        ECON_DIST["claims"] = claims
+        ECON_DIST["cpi_mm"] = cpi_mm
+        ECON_DIST["cpi_yoy"] = cpi_yoy
+        ECON_STATE["fred"] = f"claims n={len(claims)}, cpi n={len(cpi_mm)}, yoy n={len(cpi_yoy)}"
         log.info(f"econ base rates loaded from FRED ({ECON_STATE['fred']})")
     except Exception as e:
         log.error(f"FRED refresh failed, keeping static tables: {e}")
@@ -1239,6 +1284,8 @@ POLY_STATE = {
     "watched": [],
     "whales": [],
     "gaps": [],
+    "crypto_pm": [],      # PATCH 15: Poly crypto up/down inventory
+    "cand_gaps": [],      # PATCH 15: unverified cross-venue gap candidates
     "seen_trades": set(),
     "gap_alerted_at": {},
 }
@@ -1371,6 +1418,71 @@ async def poly_scan_once():
                 f"Polymarket YES {poly_yes:.1f}c / Kalshi mid {kalshi_mid:.1f}c\n"
                 f"cheaper side: {cheaper} - CHECK RESOLUTION TERMS FIRST")
     POLY_STATE["gaps"] = POLY_STATE["gaps"][:25]
+
+    # --- PATCH 15: Poly crypto up/down inventory + candidate gap logger ---
+    # User's Polymarket access is solved; before any build we MEASURE: are
+    # Poly's crypto binaries priced softer than Kalshi's? Candidate gaps are
+    # auto-matched by theme for measurement ONLY - resolution terms are NOT
+    # verified, so these never route to orders without a manual check.
+    THEMES = {"btc": ("bitcoin", "KXBTC15M"), "eth": ("ethereum", "KXETH15M"),
+              "sol": ("solana", None), "xrp": ("xrp", None)}
+    crypto_rows = []
+    for m in markets:
+        q = (m.get("question") or "") + " " + (m.get("slug") or "")
+        ql = q.lower()
+        if not any(t[0] in ql for t in THEMES.values()):
+            continue
+        if not ("up or down" in ql or "15m" in ql or "15-min" in ql
+                or "hourly" in ql or "1h" in ql or "updown" in ql):
+            continue
+        yes = _poly_yes_price(m)
+        theme = next(k for k, t in THEMES.items() if t[0] in ql)
+        crypto_rows.append({
+            "theme": theme, "question": (m.get("question") or "")[:100],
+            "slug": (m.get("slug") or "")[:80],
+            "yes_c": round(yes, 1) if yes is not None else None,
+            "vol24h": round(float(m.get("volume24hr") or m.get("volume") or 0)),
+            "liquidity": round(float(m.get("liquidity") or 0)),
+            "ends": str(m.get("endDate") or m.get("end_date") or "")[:16],
+        })
+    POLY_STATE["crypto_pm"] = crypto_rows[:25]
+
+    # candidate gaps vs Kalshi 15M mids (BTC/ETH only - SOL/XRP unmatched yet)
+    for theme, (kw, kseries) in THEMES.items():
+        if not kseries:
+            continue
+        best = next((r for r in crypto_rows
+                     if r["theme"] == theme and r["yes_c"] is not None), None)
+        if not best:
+            continue
+        try:
+            kd = await kalshi_get("/markets", params={
+                "series_ticker": kseries, "status": "open", "limit": 5})
+            km = None
+            for cand in kd.get("markets", []):
+                b, a = cents(cand, "yes_bid"), cents(cand, "yes_ask")
+                if b is not None and a is not None:
+                    km = (cand.get("ticker"), (a + b) / 2.0)
+                    break
+            if not km:
+                continue
+            gap = best["yes_c"] - km[1]
+            row = {"ts": datetime.now(timezone.utc).strftime("%m-%d %H:%M"),
+                   "theme": theme, "poly_c": best["yes_c"], "kalshi_c": round(km[1], 1),
+                   "gap_c": round(gap, 1), "kalshi_ticker": km[0],
+                   "poly_slug": best["slug"][:60]}
+            POLY_STATE["cand_gaps"].insert(0, row)
+            last = POLY_STATE["gap_alerted_at"].get(f"cand:{theme}", 0)
+            if abs(gap) >= POLY_GAP_ALERT_C and time.time() - last > 3600:
+                POLY_STATE["gap_alerted_at"][f"cand:{theme}"] = time.time()
+                await tg_send(
+                    f"POLY-KALSHI CANDIDATE GAP {abs(gap):.1f}c ({theme.upper()})\n"
+                    f"Poly {best['yes_c']}c / Kalshi {km[1]:.1f}c ({km[0]})\n"
+                    f"{best['question'][:80]}\n"
+                    f"UNVERIFIED TERMS - measurement only, no money")
+        except Exception as e:
+            log.warning(f"cand gap {theme}: {e}")
+    POLY_STATE["cand_gaps"] = POLY_STATE["cand_gaps"][:50]
     POLY_STATE["last_scan"] = datetime.now(timezone.utc).isoformat()
 
 async def poly_loop():
@@ -1433,22 +1545,71 @@ def econ_base_rate(series_title: str, m: dict):
                 return (BASE_FOMC["hike50"] if "50" in t else BASE_FOMC["hike25"]), "fomc:hike"
             return None, "fomc:unparsed"
         if any(k in st for k in ("claim", "jobless", "unemployment insurance")):
-            nums = re.findall(r"(\d{3}),?(\d{3})", t)
-            flat = [int(a + b) / 1000.0 for a, b in nums]
-            flat += [int(x) for x in re.findall(r"(\d{3})\s?k", t)]
-            if not flat:
+            # threshold form: "above 250,000" / "below 250K"
+            mnum = re.search(r"(\d{3}),?(\d{3})", t)
+            mk = re.search(r"(\d{3})\s?k", t)
+            x = (int(mnum.group(1) + mnum.group(2)) / 1000.0) if mnum else \
+                (float(mk.group(1)) if mk else None)
+            if x is None:
                 return None, "claims:unparsed"
-            x = sum(flat) / len(flat)
-            return _bracket_prob(BASE_CLAIMS, x), f"claims:~{x:.0f}K"
+            below = any(k in t for k in ("below", "under", "less than", "or less"))
+            p = dist_cdf("claims", x) if below else 1.0 - dist_cdf("claims", x)
+            return min(max(p, 0.01), 0.99), f"claims:{'<' if below else '>'}{x:.0f}K"
         if "cpi" in st or "inflation" in st:
             nums = re.findall(r"(-?\d+\.\d)\s?%", t)
             if not nums:
                 return None, "cpi:unparsed"
-            x = sum(float(v) for v in nums) / len(nums)
-            return _bracket_prob(BASE_CPI, x), f"cpi:~{x}%"
+            x = float(nums[0])
+            # YoY questions ("12-month change", "year end", *CPIYEAR*) must be
+            # measured on the YoY distribution - v1 used m/m (unit mismatch).
+            yoy = ("12-month" in t or "year" in st or "yoy" in t or "annual" in t)
+            kind = "cpi_yoy" if yoy else "cpi_mm"
+            below = any(k in t for k in ("below", "under", "less than", "or less"))
+            p = dist_cdf(kind, x) if below else 1.0 - dist_cdf(kind, x)
+            return min(max(p, 0.01), 0.99), f"{kind}:{'<' if below else '>'}{x}%"
         return None, "family:unknown"
     except Exception:
         return None, "parse:error"
+
+ECON_PAPER_FILE = "/tmp/econ_paper.ndjson"
+
+def _econ_log(rec: dict):
+    """PATCH 14: append-only paper ledger. Best-effort; never crash a scan."""
+    try:
+        with open(ECON_PAPER_FILE, "a") as fh:
+            fh.write(json.dumps(rec) + "\n")
+    except Exception as e:
+        log.warning(f"econ paper log: {e}")
+
+def _econ_rehydrate():
+    """Rebuild the paper ledger after a redeploy so the W/L record and the
+    seen-set (no duplicate alerts) survive. Called once at scanner boot."""
+    try:
+        if not os.path.exists(ECON_PAPER_FILE):
+            return
+        sigs, settled = {}, {}
+        for line in open(ECON_PAPER_FILE):
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            if r.get("type") == "signal":
+                sigs[r["ticker"]] = r["sig"]
+            elif r.get("type") == "result":
+                settled[r["ticker"]] = r
+        for tick, sig in sigs.items():
+            ECON_STATE["seen"].add(tick)
+            if tick in settled:
+                res = settled[tick]
+                sig.update(settled=True, result=res.get("result"),
+                           won=res.get("won"), pnl_c=res.get("pnl_c"))
+                ECON_STATE["settled"].append(sig)
+            else:
+                ECON_STATE["signals"].append(sig)
+        log.info(f"econ paper rehydrated: {len(settled)} settled, "
+                 f"{len(ECON_STATE['signals'])} open")
+    except Exception as e:
+        log.warning(f"econ rehydrate failed (fresh ledger): {e}")
 
 async def econ_scan_once():
     # 1) discover econ series (cached per process; refreshed each restart)
@@ -1506,6 +1667,7 @@ async def econ_scan_once():
                        "ts": datetime.now(timezone.utc).strftime("%m-%d %H:%M"),
                        "settled": False}
                 ECON_STATE["signals"].insert(0, sig)
+                _econ_log({"type": "signal", "ticker": tick, "sig": sig})
                 await tg_send(
                     f"ECON PAPER SIGNAL (no money)\n{row['title'][:80]}\n"
                     f"base rate {base*100:.0f}% vs market {mid:.1f}c -> gap {abs(gap)*100:.0f} pts\n"
@@ -1527,6 +1689,8 @@ async def econ_scan_once():
             sig["settled"] = True
             sig["result"] = result; sig["won"] = won; sig["pnl_c"] = round(pnl_c, 1)
             ECON_STATE["settled"].insert(0, dict(sig))
+            _econ_log({"type": "result", "ticker": sig["ticker"],
+                       "result": result, "won": won, "pnl_c": round(pnl_c, 1)})
             n = len(ECON_STATE["settled"])
             w = sum(1 for x in ECON_STATE["settled"] if x["won"])
             tot = sum(x["pnl_c"] for x in ECON_STATE["settled"])
@@ -1536,10 +1700,12 @@ async def econ_scan_once():
                 f"paper record: {w}W-{n-w}L, {tot:+.0f}c total")
         except Exception as e:
             log.warning(f"econ grade {sig['ticker']}: {e}")
+    ECON_STATE["signals"] = ECON_STATE["signals"][:100]  # PATCH 14: bound memory
     ECON_STATE["last_scan"] = datetime.now(timezone.utc).isoformat()
 
 async def econ_loop():
     await asyncio.sleep(25)
+    _econ_rehydrate()
     if not ECON_ENABLED:
         log.info("econ scanner disabled (ECON_ENABLED=false)")
         return
@@ -2048,6 +2214,8 @@ def poly_status():
         "pairs": [f"{a}:{b}" for a, b in POLY_KALSHI_PAIRS],
         "whales": POLY_STATE["whales"],
         "gaps": POLY_STATE["gaps"],
+        "crypto_pm": POLY_STATE["crypto_pm"],      # PATCH 15
+        "cand_gaps": POLY_STATE["cand_gaps"],      # PATCH 15
         "watched": POLY_STATE["watched"],
         "board": POLY_STATE["board"],
     }
@@ -2266,4 +2434,3 @@ async def export_download(fname: str, key: str = ""):
         return {"ok": False, "error": "no such file",
                 "files": EXPORT_STATE["files"]}
     return FileResponse(path, filename=fname)
-
