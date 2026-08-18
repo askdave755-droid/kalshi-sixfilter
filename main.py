@@ -106,6 +106,13 @@ PATCHES vs previous build:
    1h dedupe, tagged UNVERIFIED TERMS - resolution terms auto-matched by
    theme, never trusted for money without a manual check). Both surfaces
    exposed in /poly. Read-only; no Poly execution exists yet.
+16. Scan journal (Aug 17): the tape recorder. Every scan appends one NDJSON
+   line per series to /tmp/scan_journal.ndjson - quote, model p, edge,
+   r15/r45, hour, minutes-to-close, decision AND rejection reason. Losses can
+   now be joined back to the minutes BEFORE entry to see what a bad
+   environment looks like in motion. /journal (tail) + /journal/download
+   (key-guarded). Read-only; trading logic untouched. Resets on redeploy
+   like the econ paper ledger - pull it down before patching.
 """
 
 import os
@@ -1162,6 +1169,37 @@ async def monitor_positions():
             still_open.append(pos)
     STATE["open_positions"] = still_open
 
+# ------------------------------------------------------- PATCH 16: journal --
+# The tape recorder. Every scan, one NDJSON line per series: the full signal
+# context INCLUDING rejections, so losses can be studied against the minutes
+# before entry. Read-only - journaling must never break a scan.
+JOURNAL_FILE = "/tmp/scan_journal.ndjson"
+
+def _journal_scan(results):
+    try:
+        ts = datetime.now(timezone.utc).isoformat()
+        with open(JOURNAL_FILE, "a") as fh:
+            for r in results:
+                rec = {"ts": ts, "series": r.get("series"), "side": r.get("side"),
+                       "edge": r.get("edge"), "model_p": r.get("model_prob"),
+                       "yes_bid": r.get("yes_bid"), "yes_ask": r.get("yes_ask"),
+                       "mid": r.get("mid"), "r15": r.get("r15"), "r45": r.get("r45"),
+                       "momentum": r.get("momentum"), "session": r.get("session"),
+                       "mins": r.get("minutes_to_expiry"), "hour_utc": r.get("hour_utc"),
+                       "spot": r.get("spot"), "strike": r.get("strike"),
+                       "ticker": r.get("ticker"), "proceed": r.get("proceed"),
+                       "override": r.get("override"), "reason": r.get("reason")}
+                fh.write(json.dumps(rec) + "\n")
+        # cheap rotation: keep the file under ~12MB so a long week can't bloat
+        if os.path.getsize(JOURNAL_FILE) > 12_000_000:
+            with open(JOURNAL_FILE) as fh:
+                lines = fh.readlines()
+            with open(JOURNAL_FILE, "w") as fh:
+                fh.writelines(lines[-len(lines) // 2:])
+            log.info("journal rotated (kept newest half)")
+    except Exception as e:
+        log.warning(f"journal write failed: {e}")
+
 async def scan_all(execute: bool = False):
     out = []
     for s in SCAN_SERIES:
@@ -1172,6 +1210,7 @@ async def scan_all(execute: bool = False):
             out.append({"series": s, "proceed": False, "error": str(e)})
     STATE["last_scan"] = datetime.now(timezone.utc).isoformat()
     STATE["last_signals"] = out
+    _journal_scan(out)  # PATCH 16: record the tape (rejections included)
     return out
 
 
@@ -2130,6 +2169,36 @@ async function load(){
 load(); setInterval(load, 10000);
 </script></body></html>"""
 
+@app.get("/journal")
+def journal_tail(n: int = 100):
+    """PATCH 16: last n journal lines as JSON (newest last). Phone-friendly."""
+    if not os.path.exists(JOURNAL_FILE):
+        return {"lines": [], "note": "no journal yet - starts on first scan after deploy"}
+    n = max(1, min(int(n), 2000))
+    try:
+        with open(JOURNAL_FILE) as fh:
+            lines = fh.readlines()[-n:]
+        out = []
+        for ln in lines:
+            try:
+                out.append(json.loads(ln))
+            except Exception:
+                pass
+        size = os.path.getsize(JOURNAL_FILE)
+        return {"lines": out, "total_lines_on_disk": "see size_bytes",
+                "size_bytes": size}
+    except Exception as e:
+        return {"lines": [], "error": str(e)}
+
+@app.get("/journal/download")
+def journal_download(key: str = ""):
+    """Full tape pull. Key-guarded like /export - download BEFORE redeploys."""
+    if not _export_ok(key):
+        return {"ok": False, "error": "disabled or bad key"}
+    if not os.path.exists(JOURNAL_FILE):
+        return {"ok": False, "error": "no journal yet"}
+    return FileResponse(JOURNAL_FILE, filename="scan_journal.ndjson")
+
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
     return DASH_HTML
@@ -2222,7 +2291,7 @@ def poly_status():
 
 @app.get("/poly/board", response_class=HTMLResponse)
 def poly_board():
-    """Mobile-friendly Polymarket intel page - open from your phone."""
+    """Polymarket intel page - open from your phone."""
     def esc(s):
         return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
     reach = POLY_STATE["reachable"]
