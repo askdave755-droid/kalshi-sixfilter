@@ -1989,7 +1989,6 @@ async def backtest_pnl_factory(request: Request):
     edge = float(params.get("edge", 0.08))
     fee = int(params.get("fee", 1))
     
-    # Pull klines (reuses existing helper)
     closes = await _fetch_klines(symbol, days)
     if len(closes) < 500:
         return {"pnls": [], "error": "not enough kline data"}
@@ -2008,32 +2007,42 @@ async def backtest_pnl_factory(request: Request):
             spot = closes[d]
             strike = closes[d - (WINDOW - m_left)]
             win = closes[d + m_left] >= strike
-            p = prob_above(spot, strike, sigma, drift, t_eff)
-            r15_bt = math.log(closes[d] / closes[d - WINDOW])
-            p = recalibrate(p, m_left, r15_bt, sigma, symbol)
             
-            yes_ask = p * 100.0 + SPREAD_C
-            yes_bid = p * 100.0 - SPREAD_C
-            mid = (yes_ask + yes_bid) / 2.0
+            # FIX: raw model = synthetic market price (retail doesn't recalibrate)
+            p_raw = prob_above(spot, strike, sigma, drift, t_eff)
+            r15_bt = math.log(closes[d] / closes[d - WINDOW])
+            # RECALIBRATED model = our edge
+            p_model = recalibrate(p_raw, m_left, r15_bt, sigma, symbol)
+            
+            # Synthetic market centered at raw p
+            yes_ask = p_raw * 100.0 + SPREAD_C
+            yes_bid = p_raw * 100.0 - SPREAD_C
+            mid = p_raw * 100.0
+            
             if not (min_price <= yes_ask <= max_price):
                 continue
-            edge_yes = p - yes_ask / 100.0
-            edge_no = (yes_bid / 100.0) - p
+            
+            # Edge = recalibrated model vs raw market
+            edge_yes = p_model - yes_ask / 100.0
+            edge_no = (yes_bid / 100.0) - p_model
+            
             if edge_yes >= edge_no and edge_yes >= edge and mid >= 50:
                 side, entry_c = "yes", yes_ask
             elif edge_no > edge_yes and edge_no >= edge and mid < 50:
                 side, entry_c = "no", 100.0 - yes_bid
             else:
                 continue
-            if abs(p - 0.5) < 0.02:
+            
+            if abs(p_model - 0.5) < 0.02:
                 continue
+            
             fee_c = kalshi_taker_fee_cents(entry_c) if fee else 0.0
             if side == "yes":
                 pnl = (100.0 - entry_c) if win else -entry_c
             else:
                 pnl = (100.0 - entry_c) if not win else -entry_c
             pnl -= fee_c
-            all_pnls.append(round(pnl / 100.0, 4))  # convert cents -> dollars
+            all_pnls.append(round(pnl / 100.0, 4))
     
     n = len(all_pnls)
     if n == 0:
@@ -2051,6 +2060,12 @@ async def backtest_pnl_factory(request: Request):
         "win_rate": wr,
         "total_pnl": round(sum(all_pnls), 2),
     }
+
+@app.get("/")
+def root():
+
+    
+           
 
 @app.get("/")
 def root():
