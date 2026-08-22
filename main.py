@@ -1,9 +1,7 @@
 # ============================================================
 # POST /backtest/pnl — Trading-Factory compatibility
 # ============================================================
-@app.post("/backtest/pnl")
-async def backtest_pnl_factory(request: Request):
-    """
+
     Trading-Factory lab calls this with:
       {"params": {"symbol":"BTCUSDT","days":7,"band_low":58,"band_high":72,"edge":0.08,"fee":1}}
     Returns:
