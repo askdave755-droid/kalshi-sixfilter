@@ -120,6 +120,14 @@ PATCHES vs previous build:
 18. HEAD repair (Aug 23): removed an empty duplicate root() stub left by an
    Aug-22 web edit - it crashed the service with IndentationError on any
    rebuild from HEAD. No logic changes.
+19. Chase block (Aug 29): the Aug 24-25 tape autopsy showed both SixFilter
+   losses were high-price entries (>=65c) into books that had just swung
+   29-32c in <8 minutes - "bought the snap" (BTC 70c) and "caught the knife"
+   (ETH 67c). Winners were either cheap entries in wild tape or calm-tape
+   high entries - never both. New guard: track per-series mids in memory
+   each scan; if the trailing CHASE_WINDOW_MIN swing exceeds CHASE_SWING_C
+   and entry price > CHASE_PRICE_C, stand down (reason journaled). Env-gated:
+   CHASE_BLOCK=1 default on. No other logic touched.
 """
 
 import os
@@ -270,6 +278,12 @@ TRADING_HOURS_UTC = {int(w.strip()) for w in env(
 # (-$18) vs maker PF 1.05 (+$13) on IDENTICAL signals - friction was the leak.
 MAKER_MODE = env_int("MAKER_MODE", default=0)          # 1 = post resting bids
 MAKER_TTL_SEC = env_float("MAKER_TTL_SEC", default=90.0)  # cancel if unfilled
+
+# PATCH 19: chase block. See header note 19.
+CHASE_BLOCK = env_int("CHASE_BLOCK", default=1)
+CHASE_PRICE_C = env_float("CHASE_PRICE_C", default=65.0)
+CHASE_SWING_C = env_float("CHASE_SWING_C", default=20.0)
+CHASE_WINDOW_MIN = env_float("CHASE_WINDOW_MIN", default=8.0)
 
 TELEGRAM_BOT_TOKEN = env("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = env("TELEGRAM_CHAT_ID")
@@ -483,6 +497,7 @@ async def kalshi_delete(endpoint: str):
     headers = _sign_headers("DELETE", endpoint)
     async with httpx.AsyncClient(base_url=BASE_URL, timeout=15) as c:
         r = await c.delete(endpoint, headers=headers)
+        r.raise_for_status()
         return r.json() if r.text else {}
 
 # ---------------------------------------------------------------- binance ---
@@ -541,6 +556,7 @@ STATE = {
     "traded_tickers": [],
     "guard_blacklist": [],   # PATCH 7b: tickers dump-guarded off; no re-entry til next day
     "maker_orders": [],      # PATCH 10: resting bids awaiting fill/TTL
+    "mid_hist": {},          # PATCH 19: series -> [(ts, mid_c)] for the chase block
     "press": {},             # PATCH 13: series -> current pressed size
     "open_positions": [],
     "attempt_cooldown": {},
@@ -568,7 +584,7 @@ async def tg_send(text: str):
         async with httpx.AsyncClient(timeout=10) as c:
             await c.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+                json={"chat_id": chat_id, "text": text},
             )
     except Exception as e:
         log.warning(f"telegram send failed: {e}")
@@ -685,6 +701,11 @@ async def analyze_series(series: str, execute: bool = False):
         )
         return result
 
+    # PATCH 19: record the book mid every scan (the chase block reads this).
+    mh = STATE["mid_hist"].setdefault(series, [])
+    mh.append((time.time(), (yes_bid + yes_ask) / 2.0))
+    del mh[:-40]
+
     # Filter 3 — live price feed
     try:
         spot, sigma, drift, r15, r45 = await binance_stats(symbol)
@@ -789,6 +810,18 @@ async def analyze_series(series: str, execute: bool = False):
         else:
             result["reason"] = f"edge {round(edge, 3)} below threshold {EDGE_THRESHOLD}"
         return result
+
+    # Filter 5b — PATCH 19 chase block: refuse high-price entries into a
+    # violently whipsawing book (Aug 24-25 losses: bought the snap at 70c,
+    # caught the knife at 67c; both books had swung 29-32c in <8 min).
+    if CHASE_BLOCK and price_c is not None and price_c > CHASE_PRICE_C:
+        cutoff = time.time() - CHASE_WINDOW_MIN * 60.0
+        hist = [mm for tt, mm in STATE["mid_hist"].get(series, []) if tt >= cutoff]
+        if len(hist) >= 3 and (max(hist) - min(hist)) > CHASE_SWING_C:
+            result["reason"] = (
+                f"chase block: book swung {round(max(hist)-min(hist))}c in "
+                f"{CHASE_WINDOW_MIN:g}m, entry {round(price_c,1)}c > {CHASE_PRICE_C:g}c - standing down")
+            return result
 
     # Filter 6 — risk limits (trade count, duplicates, cooldown, daily spend cap)
     cooled = STATE["attempt_cooldown"].get(ticker, 0)
@@ -2118,6 +2151,8 @@ def status():
         "trading_hours_utc": sorted(TRADING_HOURS_UTC),
         "maker_mode": bool(MAKER_MODE),
         "maker_pending": len(STATE["maker_orders"]),
+        "chase_block": {"enabled": bool(CHASE_BLOCK), "price_c": CHASE_PRICE_C,
+                        "swing_c": CHASE_SWING_C, "window_min": CHASE_WINDOW_MIN},
         "scanning": SCAN_SERIES,
         "take_profit_cents": TAKE_PROFIT_CENTS,
         "open_positions": [
