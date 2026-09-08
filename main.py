@@ -164,9 +164,9 @@ def env(*names, default=""):
 KALSHI_KEY_ID = env("KALSHI_KEY_ID", "KALSHI_API_KEY_ID")
 KALSHI_ENV = env("KALSHI_ENV", default="live").lower()
 if KALSHI_ENV == "demo":
-    BASE_URL = "https://demo-api.kalshi.co/trade-api/v2"
+    BASE_URL = "https://external-api.demo.kalshi.co/trade-api/v2"
 else:
-    BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
+    BASE_URL = "https://external-api.kalshi.com/trade-api/v2"
 SIGN_PREFIX = "/trade-api/v2"
 
 SCAN_SERIES = [s.strip().upper() for s in env(
@@ -584,7 +584,7 @@ async def tg_send(text: str):
         async with httpx.AsyncClient(timeout=10) as c:
             await c.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={"chat_id": chat_id, "text": text},
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
             )
     except Exception as e:
         log.warning(f"telegram send failed: {e}")
