@@ -128,6 +128,17 @@ PATCHES vs previous build:
    each scan; if the trailing CHASE_WINDOW_MIN swing exceeds CHASE_SWING_C
    and entry price > CHASE_PRICE_C, stand down (reason journaled). Env-gated:
    CHASE_BLOCK=1 default on. No other logic touched.
+20. Maker geometry fix (Sept 13, 2026): the NO side was structurally starved
+   (59 YES / 5 NO). (a) Maker band + edge math now evaluate at the price we
+   actually expect to FILL at - the bid in maker mode, the ask in taker mode
+   - so a maker NO bid (100 - yes_ask) in a mid-40s downtrend is judged at
+   its real resting price instead of the taker price. (b) Maker edge floor
+   drops the phantom taker fee (makers pay 0). (c) Guard 1 gets the SAME mid
+   gate + floor the scan used, so momentum-override NO trades in mid 50-52
+   survive to order time instead of being re-tightened away. (d) Crash-fill
+   guard + maker post band judge fills against maker_floor_c() instead of the
+   global 55c floor. All env-gated via MAKER_MIN_PRICE_CENTS (0 = keep
+   MIN_PRICE_CENTS). MAKER_MODE=0 (taker) behavior is unchanged.
 """
 
 import os
@@ -278,6 +289,16 @@ TRADING_HOURS_UTC = {int(w.strip()) for w in env(
 # (-$18) vs maker PF 1.05 (+$13) on IDENTICAL signals - friction was the leak.
 MAKER_MODE = env_int("MAKER_MODE", default=0)          # 1 = post resting bids
 MAKER_TTL_SEC = env_float("MAKER_TTL_SEC", default=90.0)  # cancel if unfilled
+
+# PATCH 20 (Sept 13, 2026): two-sided MAKER geometry fix. The NO side was
+# structurally starved: the 55c floor + taker-fee floor + taker-price edge
+# math were calibrated for taker YES entries, so a maker NO bid (100 - yes_ask)
+# in a mid-40s downtrend landed below the floor and was rejected. Guard 1
+# also re-imposed plain mid gates at order time, aborting approved NO
+# overrides. All env-gated; MAKER_MODE=0 behavior is unchanged.
+MAKER_MIN_PRICE_CENTS = env_int("MAKER_MIN_PRICE_CENTS", default=0)  # 0 = use MIN_PRICE_CENTS
+def maker_floor_c():
+    return MAKER_MIN_PRICE_CENTS if (MAKER_MODE and MAKER_MIN_PRICE_CENTS) else MIN_PRICE_CENTS
 
 # PATCH 19: chase block. See header note 19.
 CHASE_BLOCK = env_int("CHASE_BLOCK", default=1)
@@ -687,9 +708,16 @@ async def analyze_series(series: str, execute: bool = False):
         market_status=(m.get("status") or "").lower(),
         yes_bid=yes_bid, yes_ask=yes_ask, strike=strike,
     )
-    no_price = (100.0 - yes_bid) if yes_bid is not None else None
-    yes_ok = yes_ask is not None and MIN_PRICE_CENTS <= yes_ask <= MAX_PRICE_CENTS
-    no_ok = no_price is not None and MIN_PRICE_CENTS <= no_price <= MAX_PRICE_CENTS
+    # PATCH 20: evaluate the band at the price we actually expect to FILL at
+    # - maker rests at the bid, taker crosses to the ask.
+    if MAKER_MODE:
+        eval_yes_px, eval_no_px = yes_bid, (None if yes_ask is None else 100.0 - yes_ask)
+    else:
+        eval_yes_px, eval_no_px = yes_ask, (None if yes_bid is None else 100.0 - yes_bid)
+    no_price = eval_no_px  # kept for reporting
+    _floor_c = maker_floor_c()
+    yes_ok = eval_yes_px is not None and _floor_c <= eval_yes_px <= MAX_PRICE_CENTS
+    no_ok = eval_no_px is not None and _floor_c <= eval_no_px <= MAX_PRICE_CENTS
     f["liquidity"] = (
         yes_ask is not None and yes_bid is not None and strike is not None
         and (yes_ok or no_ok)
@@ -765,13 +793,18 @@ async def analyze_series(series: str, execute: bool = False):
     # Consensus Gate: never fight the market's directional lean
     # (disagreement trades went ~0-13, agreement trades 6-1).
     # PATCH 2 (EV floor): edge must clear EDGE_THRESHOLD + taker fee.
-    edge_yes = p - yes_ask / 100.0
-    edge_no = (yes_bid / 100.0) - p
-
-    fee_yes_c = kalshi_taker_fee_cents(yes_ask, sz) / max(sz, 1)
-    fee_no_c = kalshi_taker_fee_cents(100.0 - yes_bid, sz) / max(sz, 1)
-    floor_yes = EDGE_THRESHOLD + fee_yes_c / 100.0
-    floor_no = EDGE_THRESHOLD + fee_no_c / 100.0
+    # PATCH 20: edge vs the actual execution price; makers pay 0 fees, so the
+    # taker-fee EV floor applies only in taker mode. NO edge is P(NO) - price;
+    # in taker mode this reduces exactly to the old (yes_bid/100 - p).
+    edge_yes = p - eval_yes_px / 100.0
+    edge_no = (1.0 - p) - eval_no_px / 100.0
+    if MAKER_MODE:
+        floor_yes = floor_no = EDGE_THRESHOLD
+    else:
+        fee_yes_c = kalshi_taker_fee_cents(eval_yes_px, sz) / max(sz, 1)
+        fee_no_c = kalshi_taker_fee_cents(eval_no_px, sz) / max(sz, 1)
+        floor_yes = EDGE_THRESHOLD + fee_yes_c / 100.0
+        floor_no = EDGE_THRESHOLD + fee_no_c / 100.0
     # inside the override's neutral band, demand the stricter edge
     if yes_override and mid < 50.0:
         floor_yes = max(floor_yes, MOM_OVERRIDE_EDGE)
@@ -779,9 +812,9 @@ async def analyze_series(series: str, execute: bool = False):
         floor_no = max(floor_no, MOM_OVERRIDE_EDGE)
 
     if edge_yes >= edge_no and edge_yes >= floor_yes and mid_yes_ok and yes_align_ok:
-        side, price_c, edge = "yes", yes_ask, edge_yes
+        side, price_c, edge = "yes", eval_yes_px, edge_yes
     elif edge_no > edge_yes and edge_no >= floor_no and mid_no_ok and no_align_ok:
-        side, price_c, edge = "no", 100.0 - yes_bid, edge_no
+        side, price_c, edge = "no", eval_no_px, edge_no
     else:
         side, price_c, edge = None, None, max(edge_yes, edge_no)
     f["edge"] = side is not None
@@ -847,7 +880,16 @@ async def analyze_series(series: str, execute: bool = False):
     if execute:
         STATE["attempt_cooldown"][ticker] = time.time()
         # GUARD 1 - fresh-quote re-check at order time.
-        ok_fresh, fresh_px, fresh_mid = await fresh_gate_recheck(ticker, side)
+        # PATCH 20: pass the SAME mid gate + floor the scan used, so Guard 1
+        # stops aborting momentum-override trades the scanner approved.
+        if side == "yes":
+            _mid_lo = 50.0 - (MOM_OVERRIDE_BAND if yes_override else 0.0)
+            _mid_hi = 100.0
+        else:
+            _mid_lo = 0.0
+            _mid_hi = 50.0 + (MOM_OVERRIDE_BAND if no_override else 0.0)
+        ok_fresh, fresh_px, fresh_mid = await fresh_gate_recheck(
+            ticker, side, mid_lo=_mid_lo, mid_hi=_mid_hi, price_floor=maker_floor_c())
         if not ok_fresh:
             result["proceed"] = False
             result["reason"] = "fresh-quote abort: book moved against the gate"
@@ -941,9 +983,13 @@ async def analyze_series(series: str, execute: bool = False):
     return result
 
 # --------------------------------------------------- fill-quality guards ---
-async def fresh_gate_recheck(ticker: str, side: str):
-    """Re-read the live book immediately before ordering. Returns
-    (ok, fresh_price_c, mid): ok=False means abort - do not send the order."""
+async def fresh_gate_recheck(ticker: str, side: str, mid_lo: float = 0.0,
+                             mid_hi: float = 100.0, price_floor: float | None = None):
+    """Re-read the live book immediately before ordering. PATCH 20: the mid
+    gate and price floor are passed IN from the scan - maker mode rests at
+    the bid (band checked at maker price), and momentum-override bands now
+    survive to order time instead of being re-tightened here."""
+    floor = maker_floor_c() if price_floor is None else price_floor
     try:
         data = await kalshi_get(f"/markets/{ticker}")
         m = data.get("market", {})
@@ -953,15 +999,13 @@ async def fresh_gate_recheck(ticker: str, side: str):
         if bid is None or ask is None:
             return False, None, None
         mid = (bid + ask) / 2.0
-        # PATCH 7d: re-check the PRICE BAND too, not just consensus. The 74c
-        # fill (Aug 9) and the 54c slide both passed the old mid-only check
-        # after the quote moved between scan and order.
         if side == "yes":
-            ok = mid >= 50.0 and MIN_PRICE_CENTS <= ask <= MAX_PRICE_CENTS
-            return ok, ask, mid                  # re-priced at the LIVE ask
-        no_px = 100.0 - bid
-        ok = mid < 50.0 and MIN_PRICE_CENTS <= no_px <= MAX_PRICE_CENTS
-        return ok, no_px, mid                    # NO priced off the LIVE bid
+            px = bid if MAKER_MODE else ask
+            ok = (mid_lo <= mid <= mid_hi) and floor <= px <= MAX_PRICE_CENTS
+            return ok, px, mid
+        no_px = (100.0 - ask) if MAKER_MODE else (100.0 - bid)
+        ok = (mid_lo <= mid <= mid_hi) and floor <= no_px <= MAX_PRICE_CENTS
+        return ok, no_px, mid
     except Exception as e:
         log.error(f"fresh quote {ticker}: {e}")
         return False, None, None
@@ -1019,7 +1063,7 @@ async def post_maker_order(ticker: str, side: str, count: int):
     else:
         ask = cents(m, "yes_ask")
         px = None if ask is None else 100.0 - ask
-    if px is None or not (MIN_PRICE_CENTS <= px <= MAX_PRICE_CENTS):
+    if px is None or not (maker_floor_c() <= px <= MAX_PRICE_CENTS):  # PATCH 20
         return None, px
     order = await place_order(ticker, side, px, count, maker=True)
     return order, px
@@ -1055,8 +1099,8 @@ async def manage_maker_orders():
                     f" (0 maker fee, rested {int(age)}s)\n"
                     f"model {round(mo['p'], 3)} - edge {round(mo['edge'], 3)} - expires in {round(mo['mins'], 1)}m")
                 # crash-fill guard applies to maker fills too
-                if mo["px"] < FILL_FLOOR_CENTS:
-                    if await close_position(pos, f"crash-fill guard: maker fill {round(mo['px'], 1)}c < {FILL_FLOOR_CENTS:g}c"):
+                if mo["px"] < maker_floor_c():  # PATCH 20: judge fills vs the floor we actually bid at
+                    if await close_position(pos, f"crash-fill guard: maker fill {round(mo['px'], 1)}c < {maker_floor_c():g}c"):
                         STATE["open_positions"].remove(pos)
                         if mo["ticker"] not in STATE["guard_blacklist"]:
                             STATE["guard_blacklist"].append(mo["ticker"])
